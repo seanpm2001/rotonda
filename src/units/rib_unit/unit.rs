@@ -21,7 +21,11 @@ use log::{error, log_enabled, trace};
 use non_empty_vec::NonEmpty;
 use roto::{
     traits::RotoType,
-    types::{builtin::{BuiltinTypeValue, RouteToken}, collections::ElementTypeValue, typevalue::TypeValue},
+    types::{
+        builtin::{BuiltinTypeValue, RouteToken},
+        collections::ElementTypeValue,
+        typevalue::TypeValue,
+    },
 };
 use rotonda_store::{
     custom_alloc::Upsert,
@@ -39,7 +43,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     string::ToString,
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -170,16 +174,22 @@ impl RibUnit {
         gate: Gate,
         waitpoint: WaitPoint,
     ) -> Result<(), Terminated> {
-        RibUnitRunner::new(gate, component, self.roto_path, self.rib_type, &self.rib_keys)
-            .run(
-                self.sources,
-                self.http_api_path,
-                self.query_limits,
-                self.rib_type,
-                self.vrib_upstream,
-                waitpoint,
-            )
-            .await
+        RibUnitRunner::new(
+            gate,
+            component,
+            self.roto_path,
+            self.rib_type,
+            &self.rib_keys,
+        )
+        .run(
+            self.sources,
+            self.http_api_path,
+            self.query_limits,
+            self.rib_type,
+            self.vrib_upstream,
+            waitpoint,
+        )
+        .await
     }
 
     fn default_http_api_path() -> String {
@@ -191,7 +201,12 @@ impl RibUnit {
     }
 
     fn default_rib_keys() -> NonEmpty<RouteToken> {
-        NonEmpty::try_from(vec![RouteToken::PeerIp, RouteToken::PeerAsn, RouteToken::AsPath]).unwrap()
+        NonEmpty::try_from(vec![
+            RouteToken::PeerIp,
+            RouteToken::PeerAsn,
+            RouteToken::AsPath,
+        ])
+        .unwrap()
     }
 }
 
@@ -593,6 +608,7 @@ impl RibUnitRunner {
                                                 item_count_delta,
                                                 item_count_total,
                                                 op_duration,
+                                                prefix_items,
                                             }) => {
                                                 STATS_COUNTER.with(|counter| {
                                                     *counter.borrow_mut() += 1;
@@ -624,6 +640,13 @@ impl RibUnitRunner {
                                                 //     modified_announcements,
                                                 //     new_withdrawals,
                                                 // );
+
+                                                // let weak_ref = Arc::downgrade(&prefix_items);
+                                                // drop(prefix_items);
+                                                // eprintln!("process_update_single: upsert report Arc {:?} (strong count={}, weak count={})",
+                                                //     Weak::as_ptr(&weak_ref),
+                                                //     Weak::strong_count(&weak_ref),
+                                                //     Weak::weak_count(&weak_ref))
                                             }
                                         }
                                     }
@@ -730,7 +753,7 @@ impl RibUnitRunner {
     ) -> Option<RibValue> {
         let mut new_values = HashedSet::with_capacity_and_hasher(1, HashBuildHasher::default());
 
-        for route in rib_value.iter() {
+        for route in rib_value.data().iter() {
             let in_type_value: &TypeValue = route.deref();
             let payload = Payload::TypeValue(in_type_value.clone()); // TODO: Do we really want to clone here? Or pass the Arc on?
 
@@ -875,7 +898,10 @@ mod tests {
 
         let config = mk_config_from_toml(toml).unwrap();
 
-        assert_eq!(config.rib_keys.as_slice(), &[RouteToken::PeerIp, RouteToken::PeerAsn, RouteToken::AsPath]);
+        assert_eq!(
+            config.rib_keys.as_slice(),
+            &[RouteToken::PeerIp, RouteToken::PeerAsn, RouteToken::AsPath]
+        );
     }
 
     #[test]
@@ -887,7 +913,10 @@ mod tests {
 
         let config = mk_config_from_toml(toml).unwrap();
 
-        assert_eq!(config.rib_keys.as_slice(), &[RouteToken::PeerIp, RouteToken::NextHop]);
+        assert_eq!(
+            config.rib_keys.as_slice(),
+            &[RouteToken::PeerIp, RouteToken::NextHop]
+        );
     }
 
     #[test]

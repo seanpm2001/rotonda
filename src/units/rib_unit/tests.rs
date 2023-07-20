@@ -193,7 +193,7 @@ mod tests {
             );
             assert!(matches!(match_result.match_type, MatchType::ExactMatch));
             let rib_value = match_result.prefix_meta.as_ref().unwrap();
-            assert_eq!(rib_value.len(), 2);
+            assert_eq!(rib_value.data().len(), 2);
 
             // Check the Arc reference counts. The routes HashSet should have a strong reference count of 2 because the
             // MultiThreadedStore has the original Arc around the metadata that was inserted into the store, and it clones
@@ -205,7 +205,7 @@ mod tests {
             // weak reference counts should be 0.
             assert_eq!(Arc::strong_count(rib_value.test_inner()), 2);
             assert_eq!(Arc::weak_count(rib_value.test_inner()), 0);
-            for item in rib_value.iter() {
+            for item in rib_value.data().iter() {
                 assert_eq!(Arc::strong_count(item), 1);
                 assert_eq!(Arc::weak_count(item), 0);
             }
@@ -235,10 +235,10 @@ mod tests {
             );
             assert!(matches!(match_result2.match_type, MatchType::ExactMatch));
             let rib_value = match_result2.prefix_meta.as_ref().unwrap();
-            assert_eq!(rib_value.len(), 2);
+            assert_eq!(rib_value.data().len(), 2);
             assert_eq!(Arc::strong_count(rib_value.test_inner()), 3);
             assert_eq!(Arc::weak_count(rib_value.test_inner()), 0);
-            for item in rib_value.iter() {
+            for item in rib_value.data().iter() {
                 assert_eq!(Arc::strong_count(&item), 1);
                 assert_eq!(Arc::weak_count(&item), 0);
             }
@@ -257,7 +257,7 @@ mod tests {
         let rib_value = match_result2.prefix_meta.unwrap();
         // assert_eq!(Arc::strong_count(&rib_value.per_prefix_items), 2); // TODO: MultiThreadedStore doesn't cleanup on drop...
         assert_eq!(Arc::weak_count(rib_value.test_inner()), 0);
-        for item in rib_value.iter() {
+        for item in rib_value.data().iter() {
             assert_eq!(Arc::strong_count(&item), 1);
             assert_eq!(Arc::weak_count(&item), 0);
         }
@@ -321,7 +321,7 @@ mod tests {
                     .match_prefix(&prefix, &match_options, &epoch::pin());
             assert!(matches!(match_result.match_type, MatchType::ExactMatch));
             let rib_value = match_result.prefix_meta.unwrap(); // TODO: Why do we get the actual value out of the store here and not an Arc?
-            assert_eq!(rib_value.len(), 1);
+            assert_eq!(rib_value.data().len(), 1);
         }
 
         // And SHOULD be output for forwarding to downstream units

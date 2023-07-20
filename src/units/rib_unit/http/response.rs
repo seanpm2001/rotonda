@@ -104,6 +104,7 @@ impl PrefixesApi {
         result_prefixes: &mut Vec<Value>,
     ) {
         let mut sortable_results = rib_value
+            .data()
             .iter()
             .filter(|&item| Self::include_item_in_results(filter_cfg, item))
             .map(|item| Self::mk_result(query_prefix, item, details_cfg))

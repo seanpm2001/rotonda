@@ -1,13 +1,16 @@
 use std::{
-    collections::hash_set,
+    cell::RefCell,
+    collections::VecDeque,
     hash::{BuildHasher, Hasher},
     net::IpAddr,
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use chrono::{Duration, Utc};
 use hash_hasher::{HashBuildHasher, HashedSet};
+use log::trace;
+use log::warn;
 use roto::types::{
     builtin::{BuiltinTypeValue, RotondaId, RouteStatus, RouteToken},
     datasources::Rib,
@@ -20,8 +23,21 @@ use rotonda_store::{
     MultiThreadedStore,
 };
 use routecore::{addr::Prefix, asn::Asn};
-use serde::Serialize;
+use serde::Deserialize;
+use serde::{ser::SerializeStruct, Serialize};
 use smallvec::SmallVec;
+use uuid::Uuid;
+
+use crate::common::memory::ALLOCATOR;
+
+// -------- XXX -----------------------------------------------------------------------------------------------
+
+type PrefixItems = HashedSet<Arc<PreHashedTypeValue>>;
+
+thread_local!(
+    static LRU_CANDIDATES: RefCell<VecDeque<(Prefix, Weak<PrefixItems>)>> =
+        RefCell::new(VecDeque::new());
+);
 
 // -------- PhysicalRib -----------------------------------------------------------------------------------------------
 
@@ -70,7 +86,10 @@ impl Default for PhysicalRib {
 
 impl PhysicalRib {
     pub fn new(key_fields: &[RouteToken]) -> Self {
-        let key_fields = key_fields.iter().map(|&v| vec![v as usize].into()).collect::<Vec<_>>();
+        let key_fields = key_fields
+            .iter()
+            .map(|&v| vec![v as usize].into())
+            .collect::<Vec<_>>();
         Self::with_custom_type(TypeDef::Route, key_fields)
     }
 
@@ -97,10 +116,107 @@ impl PhysicalRib {
         prefix: &Prefix,
         val: T,
     ) -> Result<(Upsert<StoreInsertionReport>, u32), PrefixStoreError> {
+        self.purge();
+
         let ty_val = val.into();
         let hash_code = self.precompute_hash_code(&ty_val);
-        let rib_value = PreHashedTypeValue::new(ty_val, hash_code).into();
-        self.rib.store.insert(prefix, rib_value)
+        let rib_value: RibValue = PreHashedTypeValue::new(ty_val, hash_code).into();
+        let saved_prefix_items = rib_value.per_prefix_items.clone();
+        let res = self.rib.store.insert(prefix, rib_value);
+
+        if let Ok((upsert, _)) = &res {
+            match upsert {
+                Upsert::Insert => {
+                    let rib_value = RibValue::from(saved_prefix_items);
+                    rib_value.enqueue(*prefix);
+                }
+                Upsert::Update(report) => {
+                    let rib_value = RibValue::from(report.prefix_items.clone());
+                    rib_value.enqueue(*prefix);
+                }
+            }
+        }
+
+        res
+    }
+
+    pub fn purge(&self) {
+        // if memory is running low, move items to disk
+        // items at the front of the queue are the oldest
+        // if the prefix referred to by the item was updated, i.e. is in use
+        // then the older weak refs to it in the queue will fail to upgrade
+        // as the Arc stored as metadata in the store will have been replaced
+        // by a new one, thus by definition any weak ref that can be upgraded
+        // refers to something that hasn't been MergedUpdate'd for a while,
+        // so this gives us a form of LRU based eviction that we can perform.
+
+        // How many items should we attempt to process at once?
+        // Keep going until we have reclaimed enough memory?
+        const TRIGGER_THRESHOLD: usize = 4_000_000;
+        const RECOVERED_THRESHOLD: usize = 2_000_000;
+        let bytes_allocated = ALLOCATOR.stats().bytes_allocated;
+        if bytes_allocated > TRIGGER_THRESHOLD {
+            LRU_CANDIDATES.with(|queue| {
+                let mut archived_count = 0usize;
+                let mut dropped_count = 0usize;
+                let mut queue = queue.borrow_mut();
+                eprintln!(
+                    "Purge: Threshold exceeded (mem allocated before: {}, queue size before: {})",
+                    bytes_allocated,
+                    queue.len()
+                );
+                while let Some((prefix, weak_ref)) = queue.pop_front() {
+                    let strong_count = Weak::strong_count(&weak_ref);
+                    if strong_count > 1 {
+                        warn!(
+                            "Purge: Unexpected strong count {} for weak ref at {:?}",
+                            strong_count,
+                            Weak::as_ptr(&weak_ref)
+                        );
+                    }
+                    if let Some(per_prefix_items) = weak_ref.upgrade() {
+                        let saved_ref = per_prefix_items.clone();
+                        // We need to insert into the store to overwrite the previous
+                        // value with the "moved to disk" placeholder value
+                        // eprintln!("Purge: archiving old item for upgraded ref {:?} (strong={} weak={})", Arc::as_ptr(&per_prefix_items), Arc::strong_count(&per_prefix_items), Arc::weak_count(&per_prefix_items));
+                        let mut rib_value = RibValue::from(per_prefix_items);
+                        rib_value.archive();
+                        archived_count += 1;
+                        // eprintln!("Purge: inserting to replacing old item with archive placeholder");
+                        self.deref().insert(&prefix, rib_value.into()).unwrap();
+                        // eprintln!("Purge: post insert saved ref {:?} (strong={} weak={})", Arc::as_ptr(&saved_ref), Arc::strong_count(&saved_ref), Arc::weak_count(&saved_ref));
+                        // Now we should be able to get rid of the old value
+                        // eprintln!("Purge: attempting to drop saved ref {:?} to now archived items", Arc::as_ptr(&saved_ref));
+                        // eprintln!("Purge: Before drop (mem allocated: {})", ALLOCATOR.stats().bytes_allocated);
+                        // This next step shouldn't be necessary, the Arc should have a single strong ref and should go
+                        // out of scope and it and its inner value should be dropped.
+                        if let Some(inner) = Arc::into_inner(saved_ref) {
+                            drop(inner);
+                            dropped_count += 1;
+                        } else {
+                            warn!("Unable to reclaim memory of newly archived prefix store items");
+                        }
+                        // } else {
+                        //     eprintln!("Purge: weak ref {:?} could not be upgraded", Weak::as_ptr(&weak_ref));
+                    }
+
+                    let bytes_allocated = ALLOCATOR.stats().bytes_allocated;
+                    if bytes_allocated < RECOVERED_THRESHOLD {
+                        eprintln!(
+                            "Purge: Threshold recovered (mem allocated: {})",
+                            bytes_allocated
+                        );
+                        break;
+                    }
+                }
+                eprintln!(
+                    "Purge: Finished (mem allocated after: {}, queue size after: {}, # archived/dropped: {}/{})",
+                    ALLOCATOR.stats().bytes_allocated,
+                    queue.len(),
+                    archived_count, dropped_count
+                );
+            });
+        }
     }
 }
 
@@ -136,7 +252,8 @@ impl PhysicalRib {
 
 #[derive(Debug, Clone, Default)]
 pub struct RibValue {
-    per_prefix_items: Arc<HashedSet<Arc<PreHashedTypeValue>>>,
+    per_prefix_items: Arc<PrefixItems>,
+    archive_id: Option<Uuid>,
 }
 
 impl PartialEq for RibValue {
@@ -146,20 +263,66 @@ impl PartialEq for RibValue {
 }
 
 impl RibValue {
-    pub fn new(items: HashedSet<Arc<PreHashedTypeValue>>) -> Self {
+    pub fn new(items: PrefixItems) -> Self {
         Self {
             per_prefix_items: Arc::new(items),
+            archive_id: None,
         }
     }
 
-    pub fn iter(&self) -> hash_set::Iter<'_, Arc<PreHashedTypeValue>> {
-        self.per_prefix_items.iter()
+    // pub fn iter(&self) -> hash_set::Iter<'_, Arc<PreHashedTypeValue>> {
+    //     self.per_prefix_items.iter()
+    // }
+
+    pub fn enqueue(&self, prefix: Prefix) {
+        if !self.is_archived() {
+            LRU_CANDIDATES.with(|queue| {
+                let mut queue = queue.borrow_mut();
+                let item = (prefix, Arc::downgrade(&self.per_prefix_items));
+                queue.push_back(item);
+            });
+        }
+    }
+
+    pub fn archive(&mut self) {
+        if !self.is_archived() {
+            let archive_id = Uuid::new_v4();
+            eprintln!("archive: writing {archive_id}");
+            let data = postcard::to_allocvec(&self.per_prefix_items).unwrap();
+            std::fs::write(format!("/tmp/{archive_id}.arc"), data).unwrap();
+            eprintln!("archive: wrote {archive_id}");
+            self.per_prefix_items = Arc::default();
+            self.archive_id = Some(archive_id);
+        }
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archive_id.is_some()
+    }
+
+    pub fn data(&self) -> Arc<PrefixItems> {
+        match self.archive_id {
+            None => self.per_prefix_items.clone(),
+            Some(archive_id) => {
+                eprintln!(
+                    "data: loading {archive_id} (mem allocated before: {})",
+                    ALLOCATOR.stats().bytes_allocated
+                );
+                let data = std::fs::read(format!("/tmp/{archive_id}.arc")).unwrap();
+                let loaded_per_prefix_items: PrefixItems = postcard::from_bytes(&data).unwrap();
+                eprintln!(
+                    "data: loaded {archive_id} (mem allocated after: {})",
+                    ALLOCATOR.stats().bytes_allocated
+                );
+                Arc::new(loaded_per_prefix_items)
+            }
+        }
     }
 }
 
 #[cfg(test)]
 impl RibValue {
-    pub fn test_inner(&self) -> &Arc<HashedSet<Arc<PreHashedTypeValue>>> {
+    pub fn test_inner(&self) -> &Arc<PrefixItems> {
         &self.per_prefix_items
     }
 }
@@ -181,6 +344,9 @@ pub struct StoreInsertionReport {
 
     /// The time taken to perform the MergeUpdate operation.
     pub op_duration: Duration,
+
+    /// The items that were inserted.
+    pub prefix_items: Arc<PrefixItems>,
 }
 
 impl MergeUpdate for RibValue {
@@ -203,14 +369,28 @@ impl MergeUpdate for RibValue {
     where
         Self: std::marker::Sized,
     {
+        if update_meta.is_archived() {
+            // This store metadata has been archived, replace the value held in the store by the given
+            // placeholder.
+            let archived_placeholder = update_meta.clone();
+            let report = StoreInsertionReport {
+                item_count_delta: 0,
+                item_count_total: self.data().len(),
+                op_duration: Duration::zero(),
+                prefix_items: archived_placeholder.per_prefix_items.clone(),
+            };
+            return Ok((archived_placeholder, report));
+        }
+
         let pre_insert = Utc::now();
         let mut item_count_delta: isize = 0;
 
         // There should only ever be one so unwrap().
-        let in_item: &TypeValue = update_meta.per_prefix_items.iter().next().unwrap();
+        let data = update_meta.data();
+        let in_item: &TypeValue = data.iter().next().unwrap();
 
         // Clone ourselves, withdrawing matching routes if the given item is a withdrawn route
-        let out_items: HashedSet<Arc<PreHashedTypeValue>> = match in_item {
+        let out_items: PrefixItems = match in_item {
             TypeValue::Builtin(BuiltinTypeValue::Route(new_route))
                 if new_route.status() == RouteStatus::Withdrawn =>
             {
@@ -230,7 +410,7 @@ impl MergeUpdate for RibValue {
                         .collect::<_>(),
 
                     Some(StoreEvictionPolicy::RemoveOnWithdraw) => {
-                        let mut out_items: HashedSet<Arc<PreHashedTypeValue>> = self
+                        let mut out_items: PrefixItems = self
                             .per_prefix_items
                             .iter()
                             .filter(|route| {
@@ -258,13 +438,20 @@ impl MergeUpdate for RibValue {
 
         let post_insert = Utc::now();
         let op_duration = post_insert - pre_insert;
+        let out_rib_value: RibValue = out_items.into();
         let user_data = StoreInsertionReport {
             item_count_delta,
-            item_count_total: out_items.len(),
+            item_count_total: out_rib_value.data().len(),
             op_duration,
+            prefix_items: out_rib_value.per_prefix_items.clone(),
         };
 
-        Ok((out_items.into(), user_data))
+        // eprintln!("clone_merge_update: Arc {:?} counts (strong={} weak={})",
+        //     Arc::as_ptr(&out_rib_value.per_prefix_items),
+        //     Arc::strong_count(&out_rib_value.per_prefix_items),
+        //     Arc::weak_count(&out_rib_value.per_prefix_items));
+
+        Ok((out_rib_value, user_data))
     }
 }
 
@@ -274,43 +461,77 @@ impl std::fmt::Display for RibValue {
     }
 }
 
-impl std::ops::Deref for RibValue {
-    type Target = HashedSet<Arc<PreHashedTypeValue>>;
+// impl std::ops::Deref for RibValue {
+//     type Target = PrefixItems;
 
-    fn deref(&self) -> &Self::Target {
-        &self.per_prefix_items
-    }
-}
+//     fn deref(&self) -> &Self::Target {
+//         match self.archive_id {
+//             Some(_archive_id) => {
+//                 panic!(
+//                     "Reading through an immutable ref to an archived RIB value is not supported"
+//                 );
+//             }
+//             None => &self.per_prefix_items,
+//         }
+//     }
+// }
 
 impl From<PreHashedTypeValue> for RibValue {
     fn from(item: PreHashedTypeValue) -> Self {
-        let mut items = HashedSet::with_capacity_and_hasher(1, HashBuildHasher::default());
+        let mut items = PrefixItems::with_capacity_and_hasher(1, HashBuildHasher::default());
         items.insert(Arc::new(item));
         Self {
             per_prefix_items: Arc::new(items),
+            archive_id: None,
         }
     }
 }
 
-impl From<HashedSet<Arc<PreHashedTypeValue>>> for RibValue {
-    fn from(value: HashedSet<Arc<PreHashedTypeValue>>) -> Self {
+impl From<PrefixItems> for RibValue {
+    fn from(value: PrefixItems) -> Self {
         Self {
             per_prefix_items: Arc::new(value),
+            archive_id: None,
+        }
+    }
+}
+
+impl From<Arc<PrefixItems>> for RibValue {
+    fn from(per_prefix_items: Arc<PrefixItems>) -> Self {
+        Self {
+            per_prefix_items,
+            archive_id: None,
         }
     }
 }
 
 // -------- PreHashedTypeValue ----------------------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PreHashedTypeValue {
     /// The route to store.
-    #[serde(flatten)]
+    // #[serde(flatten)]
     value: TypeValue,
 
-    #[serde(skip)]
+    // #[serde(skip)]
     /// The hash key as pre-computed based on the users chosen hash key fields.
     precomputed_hash: u64,
+}
+
+impl Serialize for PreHashedTypeValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            self.value.serialize(serializer)
+        } else {
+            let mut struct_ser = serializer.serialize_struct("PreHashedTypeValue", 2)?;
+            struct_ser.serialize_field("value", &self.value)?;
+            struct_ser.serialize_field("precomputed_hash", &self.precomputed_hash)?;
+            struct_ser.end()
+        }
+    }
 }
 
 impl PreHashedTypeValue {
@@ -450,15 +671,15 @@ mod tests {
     #[test]
     fn empty_by_default() {
         let rib_value = RibValue::default();
-        assert!(rib_value.is_empty());
+        assert!(rib_value.data().is_empty());
     }
 
     #[test]
     fn into_new() {
         let rib_value: RibValue = PreHashedTypeValue::new(123u8.into(), 18).into();
-        assert_eq!(rib_value.len(), 1);
+        assert_eq!(rib_value.data().len(), 1);
         assert_eq!(
-            rib_value.iter().next(),
+            rib_value.data().iter().next(),
             Some(&Arc::new(PreHashedTypeValue::new(123u8.into(), 18)))
         );
     }
@@ -473,12 +694,12 @@ mod tests {
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&value_one.into(), Some(&eviction_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 1);
+        assert_eq!(rib_value.data().len(), 1);
 
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&value_two.into(), Some(&eviction_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 2);
+        assert_eq!(rib_value.data().len(), 2);
     }
 
     #[test]
@@ -491,12 +712,12 @@ mod tests {
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&value_one.into(), Some(&eviction_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 1);
+        assert_eq!(rib_value.data().len(), 1);
 
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&value_two.into(), Some(&eviction_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 1);
+        assert_eq!(rib_value.data().len(), 1);
     }
 
     #[test]
@@ -534,26 +755,27 @@ mod tests {
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&peer_one_announcement_one.into(), Some(&update_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 1);
+        assert_eq!(rib_value.data().len(), 1);
 
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&peer_one_announcement_two.into(), Some(&update_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 2);
+        assert_eq!(rib_value.data().len(), 2);
 
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&peer_two_announcement_one.into(), Some(&update_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 3);
+        assert_eq!(rib_value.data().len(), 3);
 
         // And a withdrawal by one peer of the prefix which the RibValue represents leaves the RibValue size unchanged
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&peer_one_withdrawal.clone().into(), Some(&update_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 3);
+        assert_eq!(rib_value.data().len(), 3);
 
         // And routes from the first peer which were withdrawn are marked as such
-        let mut iter = rib_value.iter();
+        let data = rib_value.data();
+        let mut iter = data.iter();
         let first = iter.next();
         assert!(first.is_some());
         let first_ty: &TypeValue = first.unwrap().deref();
@@ -600,7 +822,7 @@ mod tests {
         let (rib_value, _user_data) = rib_value
             .clone_merge_update(&peer_one_withdrawal.into(), Some(&remove_policy))
             .unwrap();
-        assert_eq!(rib_value.len(), 1);
+        assert_eq!(rib_value.data().len(), 1);
     }
 
     #[test]
@@ -737,7 +959,11 @@ mod tests {
         assert_eq!(0, settings.allocator.stats().bytes_allocated);
     }
 
-    fn mk_route_announcement<T: Into<PeerId>>(prefix: Prefix, as_path: &str, peer_id: T) -> RawRouteWithDeltas {
+    fn mk_route_announcement<T: Into<PeerId>>(
+        prefix: Prefix,
+        as_path: &str,
+        peer_id: T,
+    ) -> RawRouteWithDeltas {
         let delta_id = (RotondaId(0), 0);
         let announcements = Announcements::from_str(&format!(
             "e [{as_path}] 10.0.0.1 BLACKHOLE,123:44 {}",

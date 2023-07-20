@@ -25,7 +25,7 @@ log-reroute        = "^0.1"
 pin-project-lite   = "^0.2"
 rand               = "^0.8"
 reqwest            = { version = "^0.11", default-features = false }
-routecore          = { version = "0.4.0-dev", features = ["bgp", "bmp", "serde"], git = "https://github.com/NLnetLabs/routecore.git" }
+routecore          = { version = "0.4.0-dev", features = ["bgp", "bmp", "serde"], git = "https://github.com/NLnetLabs/routecore.git", branch = "more-deserialization-impls" }
 sanitise-file-name = "^1.0"
 serde              = { version = "^1.0", features = ["derive", "rc"] }
 serde_json         = { version = "^1.0", features = ["preserve_order"] }
@@ -38,6 +38,7 @@ url                = { version = "^2.2", features = ["serde"] }
 allocator-api2     = "^0.2"
 async-trait        = "^0.1"
 atomic_enum        = "^0.2.0"
+postcard           = { version = "^1.0.5", features = ["alloc"] }
 flate2             = { version = "^1.0", optional = true }
 anyhow             = "^1.0"
 bytes              = { version = "1.1.0" }
@@ -50,8 +51,8 @@ layout-rs          = { version = "^0.1", optional = true }
 mqtt               = { version = "0.18.0", package = "rumqttc", default-features = false, optional = true }
 non-empty-vec      = { version = "^0.2", features = ["serde"]}
 percent-encoding   = "^2.2"
-roto               = { version = "0.1.0", git = "https://github.com/NLnetLabs/roto.git" }
-rotonda-store      = { version = "0.3.0-pre.3", git = "https://github.com/NLnetLabs/rotonda-store.git" }
+roto               = { version = "0.1.0", git = "https://github.com/NLnetLabs/roto.git", branch = "more-deserialization" }
+rotonda-store      = { version = "0.3.0-pre.3", git = "https://github.com/NLnetLabs/rotonda-store.git", branch = "more-deserialization-impls" }
 serde_with         = "^3"
 smallvec           = { version = "^1.10", features = ["const_generics", "const_new", "union"] }
 tokio-metrics      = "^0.2"
