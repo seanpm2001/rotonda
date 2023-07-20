@@ -2083,14 +2083,15 @@ dependencies = [
 [[package]]
 name = "roto"
 version = "0.1.0"
+source = "git+https://github.com/NLnetLabs/roto.git?branch=more-deserialization#bb7456812f64f8d22b14b31aef692fc5d7605237"
 dependencies = [
  "arc-swap",
  "bytes",
  "log",
  "nom",
  "paste",
- "rotonda-store 0.3.0-pre.3 (git+https://github.com/NLnetLabs/rotonda-store.git?branch=more-deserialize-impls)",
- "routecore 0.4.0-dev (git+https://github.com/NLnetLabs/routecore.git?branch=more-deserialize-impls)",
+ "rotonda-store",
+ "routecore",
  "serde",
  "smallvec",
 ]
@@ -2135,8 +2136,8 @@ dependencies = [
  "rand_pcg",
  "reqwest",
  "roto",
- "rotonda-store 0.3.0-pre.3",
- "routecore 0.4.0-dev",
+ "rotonda-store",
+ "routecore",
  "rumqttc",
  "rumqttd",
  "sanitise-file-name",
@@ -2165,59 +2166,21 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.3.0-pre.3"
+source = "git+https://github.com/NLnetLabs/rotonda-store.git?branch=more-deserialize-impls#a210b3af3676c9636f0bb5eb37e4a0c37c1cefcb"
 dependencies = [
  "arc-swap",
  "crossbeam-epoch",
  "crossbeam-utils",
  "log",
  "rotonda-macros",
- "routecore 0.4.0-dev (git+https://github.com/NLnetLabs/routecore.git?branch=more-deserialize-impls)",
+ "routecore",
  "rustc_version",
-]
-
-[[package]]
-name = "rotonda-store"
-version = "0.3.0-pre.3"
-source = "git+https://github.com/NLnetLabs/rotonda-store.git?branch=more-deserialize-impls#ee7159e1f459ac46b10f3680931bba72f2202547"
-dependencies = [
- "arc-swap",
- "crossbeam-epoch",
- "crossbeam-utils",
- "log",
- "rotonda-macros",
- "routecore 0.4.0-dev (git+https://github.com/NLnetLabs/routecore.git)",
- "rustc_version",
-]
-
-[[package]]
-name = "routecore"
-version = "0.4.0-dev"
-dependencies = [
- "bytes",
- "chrono",
- "const-str",
- "log",
- "octseq",
- "serde",
 ]
 
 [[package]]
 name = "routecore"
 version = "0.4.0-dev"
 source = "git+https://github.com/NLnetLabs/routecore.git?branch=more-deserialize-impls#d4536aedd4cc51f8eb74957a3b40a3c27b2e8376"
-dependencies = [
- "bytes",
- "chrono",
- "const-str",
- "log",
- "octseq",
- "serde",
-]
-
-[[package]]
-name = "routecore"
-version = "0.4.0-dev"
-source = "git+https://github.com/NLnetLabs/routecore.git#3c55f4e0a21cf373df40b9a40a8cdde1a4f273d9"
 dependencies = [
  "bytes",
  "chrono",
