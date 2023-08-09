@@ -4,11 +4,15 @@ use futures::{
     pin_mut,
 };
 use log::{error, info, warn};
-use rotonda::{config::{Config, ConfigFile}, common::memory::ALLOCATOR, metrics};
 use rotonda::log::ExitError;
 use rotonda::manager::Manager;
-use std::{process::exit, sync::Arc};
+use rotonda::{
+    common::memory::ALLOCATOR,
+    config::{Config, ConfigFile},
+    metrics,
+};
 use std::{env::current_dir, path::PathBuf};
+use std::{process::exit, sync::Arc};
 use tokio::{
     runtime::{self, Runtime},
     signal::{self, unix::signal, unix::SignalKind},
@@ -37,7 +41,9 @@ fn run_with_cmdline_args() -> Result<(), ExitError> {
     //   - https://github.com/NLnetLabs/routinator/blob/main/src/process.rs#L363
 
     pub fn register_metrics(manager: &Manager, name: &str, source: Arc<dyn metrics::Source>) {
-        manager.metrics().register(name.into(), Arc::downgrade(&source));
+        manager
+            .metrics()
+            .register(name.into(), Arc::downgrade(&source));
     }
 
     let mut manager = Manager::new();
