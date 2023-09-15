@@ -9,7 +9,6 @@ use std::{
 
 use chrono::{Duration, Utc};
 use hash_hasher::{HashBuildHasher, HashedSet};
-use log::trace;
 use log::warn;
 use roto::types::{
     builtin::{BuiltinTypeValue, RotondaId, RouteStatus, RouteToken},

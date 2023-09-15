@@ -43,7 +43,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     string::ToString,
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
