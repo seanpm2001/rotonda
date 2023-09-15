@@ -7,7 +7,7 @@ use log::{error, info, warn};
 use rotonda::log::ExitError;
 use rotonda::manager::Manager;
 use rotonda::{
-    common::memory::ALLOCATOR,
+    common::ALLOCATOR,
     config::{Config, ConfigFile},
     metrics,
 };
