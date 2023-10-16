@@ -12,25 +12,78 @@
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use super::{
-    metrics::BmpTcpInMetrics, router_handler::handle_router,
-    status_reporter::BmpTcpInStatusReporter,
-};
-use crate::common::status_reporter::UnitStatusReporter;
-use crate::common::{status_reporter::Chainable, unit::UnitActivity};
+use super::{metrics::BmpTcpInMetrics, status_reporter::BmpTcpInStatusReporter};
+use crate::common::unit::UnitActivity;
 use crate::manager::{Component, WaitPoint};
+use crate::payload::{Payload, SourceId};
 use crate::{
     comms::{Gate, GateStatus, Terminated},
     units::Unit,
 };
 
+use bytes::{Bytes, BytesMut};
 use futures::future::select;
+use futures::stream::Empty;
 use futures::{pin_mut, Future};
 
+use roto::types::builtin::BuiltinTypeValue;
+use roto::types::collections::BytesRecord;
+use roto::types::typevalue::TypeValue;
+use routecore::bmp::message::Message;
 use serde::Deserialize;
+use serve::buf::BufSource;
+use serve::service::{CallResult, MsgProvider, Service, ServiceError, Transaction};
+use serve::sock::AsyncAccept;
+use serve::stream::StreamServer;
+use serve::ShortBuf;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
+
+struct BmpBytes(Message<Bytes>);
+
+impl MsgProvider for BmpBytes {
+    const MIN_HDR_BYTES: usize = 5;
+
+    type ReqOcts = Bytes;
+
+    type Msg = Message<Self::ReqOcts>;
+
+    fn determine_msg_len(hdr_buf: &[u8]) -> (usize, bool) {
+        let _version = hdr_buf[0];
+        let len = u32::from_be_bytes(hdr_buf[1..5].try_into().unwrap()) as usize;
+        (len, true)
+    }
+
+    fn from_octets(octets: Self::ReqOcts) -> Result<Self::Msg, ShortBuf> {
+        Message::from_octets(octets).map_err(|_err| ShortBuf)
+    }
+}
+
+pub type SrvOut = Result<CallResult<BytesMut>, ServiceError<()>>;
+
+fn service_factory(gate: Gate, source_id: SourceId) -> impl Service<SocketAddr, BmpBytes> {
+    #[allow(clippy::type_complexity)]
+    fn service<SrvErr>(
+        addr: SocketAddr,
+        msg: <BmpBytes as MsgProvider>::Msg,
+        gate: Gate,
+        source_id: SourceId,
+    ) -> Result<Transaction<impl Future<Output = SrvOut>, Empty<SrvOut>>, ServiceError<SrvErr>>
+    {
+        eprintln!("BMP message received from {}", addr);
+        let bmp_msg = Arc::new(BytesRecord(msg));
+        let value = TypeValue::Builtin(BuiltinTypeValue::BmpMessage(bmp_msg));
+        let payload = Payload::new(source_id, value);
+        Ok(Transaction::Single(async move {
+            gate.update_data(payload.into()).await;
+            Err(ServiceError::ServiceSpecificError(()))
+        }))
+    }
+
+    move |addr, msg| service(addr, msg, gate.clone(), source_id.clone())
+}
 
 //--- TCP listener traits ----------------------------------------------------
 //
@@ -63,6 +116,22 @@ struct StandardTcpListener(::tokio::net::TcpListener);
 impl TcpListener for StandardTcpListener {
     async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
         self.0.accept().await
+    }
+}
+
+impl AsyncAccept for StandardTcpListener {
+    type Addr = SocketAddr;
+    type Error = std::io::Error;
+    type StreamType = TcpStream;
+    type Stream = futures::future::Ready<Result<Self::StreamType, std::io::Error>>;
+
+    #[allow(clippy::type_complexity)]
+    fn poll_accept(
+        &self,
+        cx: &mut Context,
+    ) -> Poll<Result<(Self::Stream, Self::Addr), std::io::Error>> {
+        tokio::net::TcpListener::poll_accept(&self.0, cx)
+            .map(|res| res.map(|(stream, addr)| (futures::future::ready(Ok(stream)), addr)))
     }
 }
 
@@ -113,8 +182,9 @@ impl BmpTcpIn {
         // updates won't send them while we are in process_until() which will just eat them without handling them.
         waitpoint.running().await;
 
+        let service_factory = service_factory(gate.clone(), "dummy".into()).into();
         BmpTcpInRunner::new(self, gate, metrics, status_reporter)
-            .run(Arc::new(StandardTcpListenerFactory))
+            .run(Arc::new(StandardTcpListenerFactory), service_factory)
             .await
     }
 }
@@ -141,14 +211,38 @@ impl BmpTcpInRunner {
         }
     }
 
-    async fn run<T, U>(mut self, listener_factory: Arc<T>) -> Result<(), crate::comms::Terminated>
+    async fn run<T, U, V, W>(
+        mut self,
+        listener_factory: Arc<T>,
+        service_factory: Arc<V>,
+    ) -> Result<(), crate::comms::Terminated>
     where
         T: TcpListenerFactory<U>,
-        U: TcpListener,
+        U: TcpListener + std::marker::Send + AsyncAccept + 'static,
+        V: Service<<U as AsyncAccept>::Addr, W> + Send + Sync + 'static,
+        W: MsgProvider + Send + Sync + 'static,
+        <W as MsgProvider>::ReqOcts: std::convert::From<BytesMut> + Send + Sync,
     {
+        struct BytesBufSource;
+
+        impl BufSource for BytesBufSource {
+            type Output = BytesMut;
+
+            fn create_buf(&self) -> Self::Output {
+                BytesMut::new()
+            }
+
+            fn create_sized(&self, size: usize) -> Self::Output {
+                let mut buf = BytesMut::with_capacity(size);
+                buf.resize(size, 0);
+                buf
+            }
+        }
+
         // Loop until terminated, accepting TCP connections from routers and
         // spawning tasks to handle them.
         let status_reporter = self.status_reporter.clone();
+        let buf_source = Arc::new(BytesBufSource);
 
         loop {
             let listen_addr = self.bmp.listen.clone();
@@ -176,38 +270,23 @@ impl BmpTcpInRunner {
 
             status_reporter.listener_listening(&listen_addr);
 
-            'inner: loop {
-                match self.process_until(listener.accept()).await {
-                    ControlFlow::Continue(Ok((tcp_stream, client_addr))) => {
-                        status_reporter.listener_connection_accepted(client_addr);
+            let srv = StreamServer::new(listener, buf_source.clone(), service_factory.clone());
+            let srv = Arc::new(srv);
 
-                        // Spawn a task to handle the newly connected routers BMP
-                        // message stream.
-
-                        // Choose a name to be reported in application logs.
-                        let child_name =
-                            format!("router[{}:{}]", client_addr.ip(), client_addr.port());
-
-                        // Create a status reporter whose name in output will be
-                        // a combination of ours as parent and the newly chosen
-                        // child name, enabling logged messages relating to this
-                        // newly connected router to be distinguished from logged
-                        // messages relating to other connected routers.
-                        let child_status_reporter =
-                            Arc::new(self.status_reporter.add_child(&child_name));
-
-                        crate::tokio::spawn(
-                            &child_name,
-                            handle_router(
-                                self.gate.clone(),
-                                tcp_stream,
-                                client_addr,
-                                child_status_reporter,
-                            ),
-                        );
+            match self.process_until(srv.clone().run()).await {
+                ControlFlow::Continue(Ok(_v)) => { /* TODO: The TCP server shutdown... what now? */ }
+                ControlFlow::Continue(Err(_err)) => {
+                    // Stop listening on the current listen port.
+                    if let Err(err) = srv.shutdown() {
+                        eprintln!("Error while shutting down TCP server: {err}");
                     }
-                    ControlFlow::Continue(Err(_err)) => break 'inner,
-                    ControlFlow::Break(Terminated) => return Err(Terminated),
+                    eprintln!("Rebinding...");
+                }
+                ControlFlow::Break(Terminated) => {
+                    if let Err(err) = srv.shutdown() {
+                        eprintln!("Error while shutting down TCP server: {err}");
+                    }
+                    return Err(Terminated);
                 }
             }
         }
@@ -273,7 +352,7 @@ impl BmpTcpInRunner {
                 }
 
                 UnitActivity::Terminated => {
-                    self.status_reporter.terminated();
+                    // self.status_reporter.terminated();
                     return ControlFlow::Break(Terminated);
                 }
             }
@@ -289,22 +368,32 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::{net::TcpStream, time::timeout};
+    use futures::{stream::Empty, Future};
+    use serve::{
+        service::{MsgProvider, Service, ServiceError, Transaction},
+        sock::AsyncAccept,
+    };
+    use tokio::{
+        io::{AsyncRead, AsyncWrite},
+        net::TcpStream,
+        time::timeout,
+    };
 
     use crate::{
+        common::status_reporter::AnyStatusReporter,
         comms::{Gate, GateAgent},
         tests::util::internal::{enable_logging, get_testable_metrics_snapshot},
         units::{
             bmp_tcp_in::{
                 metrics::BmpTcpInMetrics,
                 status_reporter::BmpTcpInStatusReporter,
-                unit::{BmpTcpInRunner, TcpListener, TcpListenerFactory},
+                unit::{BmpTcpInRunner, SrvOut, TcpListener, TcpListenerFactory},
             },
             Unit,
-        }, common::status_reporter::AnyStatusReporter,
+        },
     };
 
-    use super::BmpTcpIn;
+    use super::{BmpBytes, BmpTcpIn};
 
     struct MockTcpListenerFactory<T>
     where
@@ -348,6 +437,73 @@ mod tests {
         }
     }
 
+    struct MockStreamType;
+
+    impl AsyncWrite for MockStreamType {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            todo!()
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            todo!()
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            todo!()
+        }
+    }
+
+    impl AsyncRead for MockStreamType {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            todo!()
+        }
+    }
+
+    impl AsyncAccept for MockTcpListener {
+        type Addr = ();
+
+        type Error = ();
+
+        type StreamType = MockStreamType;
+
+        type Stream = futures::future::Ready<Result<Self::StreamType, Self::Error>>;
+
+        fn poll_accept(
+            &self,
+            _cx: &mut std::task::Context,
+        ) -> std::task::Poll<Result<(Self::Stream, Self::Addr), std::io::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    fn noop_service_factory() -> impl Service<(), BmpBytes> {
+        #[allow(clippy::type_complexity)]
+        fn service<SrvErr>(
+            _msg: <BmpBytes as MsgProvider>::Msg,
+        ) -> Result<Transaction<impl Future<Output = SrvOut>, Empty<SrvOut>>, ServiceError<SrvErr>>
+        {
+            Ok(Transaction::Single(async move {
+                Err(ServiceError::ServiceSpecificError(()))
+            }))
+        }
+
+        move |_addr, msg| service(msg)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_reconfigured_bind_address() {
         // Given an instance of the BMP TCP input unit that is configured to
@@ -355,7 +511,7 @@ mod tests {
         let (runner, agent) = setup_test("localhost:8080");
         let status_reporter = runner.status_reporter.clone();
         let mock_listener_factory = Arc::new(MockTcpListenerFactory::new(|_| Ok(())));
-        let task = runner.run(mock_listener_factory.clone());
+        let task = runner.run(mock_listener_factory.clone(), noop_service_factory().into());
         let join_handle = tokio::task::spawn(task);
 
         // Allow time for bind attempts to occur
@@ -388,9 +544,18 @@ mod tests {
         assert_eq!(binds[1], "otherhost:8081");
 
         let metrics = get_testable_metrics_snapshot(&status_reporter.metrics().unwrap());
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"), 2);
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"), 0);
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"), 0);
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"),
+            2
+        );
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"),
+            0
+        );
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"),
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -400,7 +565,7 @@ mod tests {
         let (runner, agent) = setup_test("localhost:8080");
         let status_reporter = runner.status_reporter.clone();
         let mock_listener_factory = Arc::new(MockTcpListenerFactory::new(|_| Ok(())));
-        let task = runner.run(mock_listener_factory.clone());
+        let task = runner.run(mock_listener_factory.clone(), noop_service_factory().into());
         let join_handle = tokio::task::spawn(task);
 
         // Allow time for bind attempts to occur
@@ -431,10 +596,18 @@ mod tests {
         assert_eq!(binds[0], "localhost:8080");
 
         let metrics = get_testable_metrics_snapshot(&status_reporter.metrics().unwrap());
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"), 1);
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"), 0);
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"), 0);
-
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"),
+            1
+        );
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"),
+            0
+        );
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"),
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -451,7 +624,7 @@ mod tests {
         let (runner, agent) = setup_test("idontexist:-1");
         let status_reporter = runner.status_reporter.clone();
         let mock_listener_factory = Arc::new(MockTcpListenerFactory::new(fail_on_bad_addr));
-        let task = runner.run(mock_listener_factory.clone());
+        let task = runner.run(mock_listener_factory.clone(), noop_service_factory().into());
         let join_handle = tokio::task::spawn(task);
 
         // Allow time for bind attempts to occur
@@ -482,9 +655,18 @@ mod tests {
         assert_eq!(binds[0], "localhost:8080");
 
         let metrics = get_testable_metrics_snapshot(&status_reporter.metrics().unwrap());
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"), 1);
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"), 0);
-        assert_eq!(metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"), 0);
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"),
+            1
+        );
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"),
+            0
+        );
+        assert_eq!(
+            metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"),
+            0
+        );
     }
 
     //-------- Test helpers --------------------------------------------------

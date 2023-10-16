@@ -364,7 +364,7 @@ impl BgpTcpInRunner {
                 }
 
                 UnitActivity::Terminated => {
-                    self.status_reporter.terminated();
+                    // self.status_reporter.terminated();
                     return ControlFlow::Break(Terminated);
                 }
             }
