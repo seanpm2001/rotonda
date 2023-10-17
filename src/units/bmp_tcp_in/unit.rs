@@ -34,7 +34,11 @@ use roto::types::typevalue::TypeValue;
 use routecore::bmp::message::Message;
 use serde::Deserialize;
 use serve::buf::BufSource;
-use serve::service::{CallResult, MsgProvider, Service, ServiceError, Transaction};
+use serve::service::{
+    CallResult,
+    MsgLayout::{self, MsgContainsLen},
+    MsgProvider, Service, ServiceError, Transaction,
+};
 use serve::sock::AsyncAccept;
 use serve::stream::StreamServer;
 use serve::ShortBuf;
@@ -43,46 +47,122 @@ use tokio::time::{sleep, Duration};
 
 struct BmpBytes(Message<Bytes>);
 
+/// Message length determination and deserialization for BMP message streams.
 impl MsgProvider for BmpBytes {
+    /// According to RFC 7854 "BGP Monitoring Protocol (BMP)" one must read 5
+    /// bytes of an incoming message in order to know how many more bytes
+    /// remain to be read.
+    ///
+    /// 4.1.  Common Header
+    ///
+    /// The following common header appears in all BMP messages.  The rest of
+    /// the data in a BMP message is dependent on the Message Type field in
+    /// the common header.
+    ///
+    ///    0                   1                   2                   3
+    ///    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    ///   +-+-+-+-+-+-+-+-+
+    ///   |    Version    |
+    ///   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    ///   |                        Message Length                         |
+    ///   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    ///   |   Msg. Type   |
+    ///   +---------------+
+    ///
+    /// From: https://datatracker.ietf.org/doc/html/rfc7854#section-4.1
     const MIN_HDR_BYTES: usize = 5;
 
+    /// And thus we also know that the message length bytes are part of the
+    /// actual BMP message that we want to have as the output of deserializing
+    /// a complete BMP message byte sequence.
+    const MSG_LAYOUT: MsgLayout = MsgContainsLen;
+
+    /// Process incoming Bytes.
     type ReqOcts = Bytes;
 
+    /// And deserialize them to BMP `Message` objects that refer to those
+    /// read bytes.
     type Msg = Message<Self::ReqOcts>;
 
-    fn determine_msg_len(hdr_buf: &[u8]) -> (usize, bool) {
+    fn len(hdr_buf: &[u8]) -> usize {
         let _version = hdr_buf[0];
-        let len = u32::from_be_bytes(hdr_buf[1..5].try_into().unwrap()) as usize;
-        (len, true)
+        // SAFETY: we should only be invoked once MSG_HDR_BYTES worth of bytes
+        // have already been read and so should be safe to index into at least
+        // that many bytes of the given header buffer.
+        u32::from_be_bytes(hdr_buf[1..5].try_into().unwrap()) as usize
     }
 
     fn from_octets(octets: Self::ReqOcts) -> Result<Self::Msg, ShortBuf> {
+        // TODO: Do something with the actual error message?
         Message::from_octets(octets).map_err(|_err| ShortBuf)
     }
 }
 
 pub type SrvOut = Result<CallResult<BytesMut>, ServiceError<()>>;
 
-fn service_factory(gate: Gate, source_id: SourceId) -> impl Service<SocketAddr, BmpBytes> {
+#[derive(Clone, Debug)]
+struct BmpStreamHandler {
+    status_reporter: Arc<BmpTcpInStatusReporter>,
+    source_id: SourceId,
+    gate: Gate,
+}
+
+impl BmpStreamHandler {
+    fn new(
+        gate: Gate,
+        status_reporter: Arc<BmpTcpInStatusReporter>,
+        source_id: SourceId,
+    ) -> impl Service<SocketAddr, BmpBytes> {
+        let state = Self {
+            status_reporter,
+            source_id,
+            gate,
+        };
+
+        // The inner clones are a problem, they'll happen on EVERY message.
+        // This is due to the lack of strict ordering of processing of messages
+        // for a single TCP stream, even with the introduction of
+        // Transaction::OrderedXxx() which does guarantee ordering but the
+        // compiler can't tell that so can't let us use a single cloned gate
+        // per stream.
+        let f1_state = state.clone();
+        let f1 = move |addr| f1_state.clone().connect(addr);
+
+        let f2_state = state.clone();
+        let f2 = move |addr, msg| f2_state.clone().call(addr, msg);
+
+        let f3_state = state.clone();
+        let f3 = move |addr| f3_state.clone().disconnect(addr);
+
+        (f1, f2, f3)
+    }
+
+    fn connect(self, addr: SocketAddr) {
+        self.status_reporter.router_id_changed(addr);
+    }
+
     #[allow(clippy::type_complexity)]
-    fn service<SrvErr>(
+    fn call<SrvErr>(
+        self,
         addr: SocketAddr,
         msg: <BmpBytes as MsgProvider>::Msg,
-        gate: Gate,
-        source_id: SourceId,
     ) -> Result<Transaction<impl Future<Output = SrvOut>, Empty<SrvOut>>, ServiceError<SrvErr>>
     {
-        eprintln!("BMP message received from {}", addr);
+        self.status_reporter.bmp_message_received(addr);
         let bmp_msg = Arc::new(BytesRecord(msg));
         let value = TypeValue::Builtin(BuiltinTypeValue::BmpMessage(bmp_msg));
-        let payload = Payload::new(source_id, value);
-        Ok(Transaction::Single(async move {
-            gate.update_data(payload.into()).await;
+        let payload = Payload::new(self.source_id.clone(), value);
+        Ok(Transaction::OrderedSingle(async move {
+            self.gate.update_data(payload.into()).await;
+            // This strange looking return error is a hack to say that there is no
+            // response message... TO DO: make a better API for this... sigh.
             Err(ServiceError::ServiceSpecificError(()))
         }))
     }
 
-    move |addr, msg| service(addr, msg, gate.clone(), source_id.clone())
+    fn disconnect(self, addr: SocketAddr) {
+        self.status_reporter.router_connection_lost(addr)
+    }
 }
 
 //--- TCP listener traits ----------------------------------------------------
@@ -182,9 +262,13 @@ impl BmpTcpIn {
         // updates won't send them while we are in process_until() which will just eat them without handling them.
         waitpoint.running().await;
 
-        let service_factory = service_factory(gate.clone(), "dummy".into()).into();
+        let service = BmpStreamHandler::new(
+            gate.clone(),
+            status_reporter.clone(),
+            "dummy source id".into(),
+        );
         BmpTcpInRunner::new(self, gate, metrics, status_reporter)
-            .run(Arc::new(StandardTcpListenerFactory), service_factory)
+            .run(Arc::new(StandardTcpListenerFactory), service.into())
             .await
     }
 }
@@ -222,6 +306,7 @@ impl BmpTcpInRunner {
         V: Service<<U as AsyncAccept>::Addr, W> + Send + Sync + 'static,
         W: MsgProvider + Send + Sync + 'static,
         <W as MsgProvider>::ReqOcts: std::convert::From<BytesMut> + Send + Sync,
+        <W as MsgProvider>::Msg: Send,
     {
         struct BytesBufSource;
 
@@ -274,7 +359,8 @@ impl BmpTcpInRunner {
             let srv = Arc::new(srv);
 
             match self.process_until(srv.clone().run()).await {
-                ControlFlow::Continue(Ok(_v)) => { /* TODO: The TCP server shutdown... what now? */ }
+                ControlFlow::Continue(Ok(_v)) => { /* TODO: The TCP server shutdown... what now? */
+                }
                 ControlFlow::Continue(Err(_err)) => {
                     // Stop listening on the current listen port.
                     if let Err(err) = srv.shutdown() {

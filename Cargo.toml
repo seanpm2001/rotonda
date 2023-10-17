@@ -59,7 +59,7 @@ serde_with         = "^3"
 smallvec           = { version = "^1.11", features = ["const_generics", "const_new", "union"] }
 tokio-metrics      = { version = "^0.3", default-features = false }
 uuid               = { version = "^1.4", features = ["v4", "fast-rng"] }
-serve              = { version = "0.1.0", path = "../serve" }
+serve              = { version = "0.1.0", path = "../serve" } #, rev = "8088578bb0e1f54d624385d96ed6e69746d42ffc" }
 
 [target.'cfg(unix)'.dependencies]
 syslog             = "^6.1"
