@@ -33,6 +33,12 @@ pub enum SourceId {
     Named(Arc<String>),
 }
 
+impl Default for SourceId {
+    fn default() -> Self {
+        "unknown".into()
+    }
+}
+
 impl SourceId {
     pub fn socket_addr(&self) -> Option<&SocketAddr> {
         match self {

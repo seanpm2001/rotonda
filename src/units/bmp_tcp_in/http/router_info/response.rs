@@ -1,21 +1,22 @@
 use std::sync::{atomic::Ordering, Arc, RwLock};
 
 use chrono::{DateTime, Utc};
-use hyper::{Body, Response, StatusCode};
+use hyper::{Body, Response};
 use indoc::formatdoc;
 
 use crate::{
+    http,
     payload::{RouterId, SourceId},
-    units::bmp_in::{
+    units::bmp_tcp_in::{
         metrics::{BmpInMetrics, RouterMetrics},
         state_machine::{
             machine::{PeerAware, PeerStates},
             metrics::BmpMetrics,
         },
-    }, http,
+    },
 };
 
-use super::RouterInfoApi;
+pub struct RouterInfoApi;
 
 /// A Display formatted Per Peer Header
 pub type PeerKey = String;
@@ -34,7 +35,7 @@ impl RouterInfoApi {
         http_resources: http::Resources,
         base_http_path: String,
         source_id: SourceId,
-        router_id: Arc<RouterId>,
+        router_id: Arc<String>,
         sys_name: &str,
         sys_desc: &str,
         sys_extra: &[String],
@@ -243,7 +244,7 @@ impl RouterInfoApi {
                                 writeln!(peer_report, "</pre></td></tr>").unwrap();
                             }
                         }
-                    }
+                    },
                 }
             }
 

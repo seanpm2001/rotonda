@@ -258,15 +258,14 @@ impl Processor {
                                         self.gate.update_data(update).await;
                                     }
                                     if let TypeValue::Builtin(BuiltinTypeValue::BgpUpdateMessage(pdu)) = east {
-                                        if let Some(pdu) = Arc::into_inner(pdu) {
-                                            let pdu = pdu.raw_message().0.clone(); // Bytes is cheap to clone
-                                            let update = self.process_update(
-                                                pdu,
-                                                //negotiated.remote_addr(),
-                                                //negotiated.remote_asn()
-                                            ).await;
-                                            self.gate.update_data(update).await;
-                                        }
+                                        let pdu = Arc::into_inner(pdu).unwrap(); // This should succeed
+                                        let pdu = pdu.raw_message().0.clone(); // Bytes is cheap to clone
+                                        let update = self.process_update(
+                                            pdu,
+                                            //negotiated.remote_addr(),
+                                            //negotiated.remote_asn()
+                                        ).await;
+                                        self.gate.update_data(update).await;
                                     }
                                 }
                             } else {

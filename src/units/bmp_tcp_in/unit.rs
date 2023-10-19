@@ -1,38 +1,49 @@
-//! A unit that acts as a BMP "monitoring station".
-//!
-//! According to [RFC #7854] _"The BGP Monitoring Protocol (BMP) \[sic\] can
-//! be used to monitor BGP sessions. BMP& is intended to provide a convenient
-//! interface for obtaining route views"_.
-//!
-//! This unit accepts BMP data over incoming TCP connections from one or more
-//! routers to a specified TCP IP address and port number on which we listen.
-//!
-//! [RFC #7854]: https://tools.ietf.org/html/rfc7854
+use std::{
+    cell::RefCell,
+    sync::{Arc, RwLock, Weak},
+};
 
-use std::net::SocketAddr;
-use std::ops::ControlFlow;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
-use super::{metrics::BmpTcpInMetrics, status_reporter::BmpTcpInStatusReporter};
-use crate::common::unit::UnitActivity;
-use crate::manager::{Component, WaitPoint};
-use crate::payload::{Payload, SourceId};
+use crate::{
+    common::{
+        frim::FrimMap,
+        roto::{FilterName, FilterOutput, RotoScripts, ThreadLocalVM},
+        status_reporter::Chainable,
+    },
+    manager::{Component, WaitPoint},
+    payload::{Payload, RouterId, SourceId}, http,
+    // units::bmp_tcp_in::status_reporter::BmpTcpInStatusReporter,
+};
 use crate::{
     comms::{Gate, GateStatus, Terminated},
     units::Unit,
 };
+use crate::{
+    tokio::TokioTaskMetrics,
+    units::bmp_tcp_in::{
+        metrics::BmpInMetrics,
+        state_machine::{machine::BmpState, processing::MessageType},
+        status_reporter::BmpInStatusReporter,
+    },
+};
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use roto::types::{builtin::BuiltinTypeValue, collections::BytesRecord, typevalue::TypeValue};
+use serde::Deserialize;
+use toml::value::Datetime;
 
-use bytes::{Bytes, BytesMut};
+use std::net::SocketAddr;
+use std::ops::ControlFlow;
+use std::task::{Context, Poll};
+
+use crate::common::unit::UnitActivity;
+
+use bytes::BytesMut;
 use futures::future::select;
 use futures::stream::Empty;
 use futures::{pin_mut, Future};
 
-use roto::types::builtin::BuiltinTypeValue;
-use roto::types::collections::BytesRecord;
-use roto::types::typevalue::TypeValue;
 use routecore::bmp::message::Message;
-use serde::Deserialize;
 use serve::buf::BufSource;
 use serve::service::{
     CallResult,
@@ -44,6 +55,18 @@ use serve::stream::StreamServer;
 use serve::ShortBuf;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
+
+#[cfg(feature = "router-list")]
+use super::{http::RouterListApi, types::RouterInfo};
+
+use super::state_machine::metrics::BmpMetrics;
+use super::util::format_source_id;
+
+//-------- Constants ---------------------------------------------------------
+
+pub const UNKNOWN_ROUTER_SYSNAME: &str = "unknown";
+
+//-------- XXXX --------------------------------------------------------------
 
 struct BmpBytes(Message<Bytes>);
 
@@ -93,75 +116,321 @@ impl MsgProvider for BmpBytes {
     }
 
     fn from_octets(octets: Self::ReqOcts) -> Result<Self::Msg, ShortBuf> {
-        // TODO: Do something with the actual error message?
+        // TODO: Do something with the error message?
         Message::from_octets(octets).map_err(|_err| ShortBuf)
     }
 }
 
 pub type SrvOut = Result<CallResult<BytesMut>, ServiceError<()>>;
 
+#[cfg(feature = "router-list")]
 #[derive(Clone, Debug)]
-struct BmpStreamHandler {
-    status_reporter: Arc<BmpTcpInStatusReporter>,
-    source_id: SourceId,
-    gate: Gate,
+pub struct ConnSummary {
+    pub connected_at: Arc<DateTime<Utc>>,
+    pub last_msg_at: Arc<RwLock<DateTime<Utc>>>,
+    pub bmp_state: Weak<RwLock<Option<BmpState>>>,
 }
 
-impl BmpStreamHandler {
-    fn new(
-        gate: Gate,
-        status_reporter: Arc<BmpTcpInStatusReporter>,
-        source_id: SourceId,
-    ) -> impl Service<SocketAddr, BmpBytes> {
-        let state = Self {
-            status_reporter,
-            source_id,
-            gate,
-        };
+#[derive(Default)]
+struct BmpStreamState {
+    source_id: SourceId,
 
+    gate: Arc<Gate>, // TODO: this should be an Arc<ArcSwap<..>> so it can be reconfigured
+
+    status_reporter: Arc<BmpInStatusReporter>,
+
+    bmp_state: Arc<RwLock<Option<BmpState>>>,
+
+    router_id_template: Arc<ArcSwap<String>>,
+
+    roto_scripts: RotoScripts,
+
+    filter_name: Arc<ArcSwap<FilterName>>,
+
+    #[cfg(feature = "router-list")]
+    conn_summaries: Arc<FrimMap<SocketAddr, ConnSummary>>,
+}
+
+#[derive(Clone, Debug)]
+struct BmpTcpStreamServiceFactory;
+
+impl BmpTcpStreamServiceFactory {
+    thread_local!(
+        static VM: ThreadLocalVM = RefCell::new(None);
+    );
+
+    fn build(
+        gate: Gate,
+        bmp_metrics: Arc<BmpMetrics>,
+        status_reporter: Arc<BmpInStatusReporter>,
+        router_id_template: Arc<ArcSwap<String>>,
+        roto_scripts: RotoScripts,
+        filter_name: Arc<ArcSwap<FilterName>>,
+        #[cfg(feature = "router-list")] conn_summaries: Arc<FrimMap<SocketAddr, ConnSummary>>,
+    ) -> impl Service<SocketAddr, BmpBytes, BmpStreamState> {
         // The inner clones are a problem, they'll happen on EVERY message.
         // This is due to the lack of strict ordering of processing of messages
         // for a single TCP stream, even with the introduction of
         // Transaction::OrderedXxx() which does guarantee ordering but the
         // compiler can't tell that so can't let us use a single cloned gate
         // per stream.
-        let f1_state = state.clone();
-        let f1 = move |addr| f1_state.clone().connect(addr);
+        let connect_fn = move |addr| {
+            Self::connect(
+                addr,
+                gate.clone(),
+                bmp_metrics.clone(),
+                status_reporter.clone(),
+                router_id_template.clone(),
+                roto_scripts.clone(),
+                filter_name.clone(),
+                #[cfg(feature = "router-list")]
+                conn_summaries.clone(),
+            )
+        };
 
-        let f2_state = state.clone();
-        let f2 = move |addr, msg| f2_state.clone().call(addr, msg);
-
-        let f3_state = state.clone();
-        let f3 = move |addr| f3_state.clone().disconnect(addr);
-
-        (f1, f2, f3)
+        (connect_fn, Self::call, Self::disconnect)
     }
 
-    fn connect(self, addr: SocketAddr) {
-        self.status_reporter.router_id_changed(addr);
+    fn connect(
+        addr: SocketAddr,
+        gate: Gate,
+        bmp_metrics: Arc<BmpMetrics>,
+        status_reporter: Arc<BmpInStatusReporter>,
+        router_id_template: Arc<ArcSwap<String>>,
+        roto_scripts: RotoScripts,
+        filter_name: Arc<ArcSwap<FilterName>>,
+        #[cfg(feature = "router-list")] conn_summaries: Arc<FrimMap<SocketAddr, ConnSummary>>,
+    ) -> Result<Option<BmpStreamState>, ()> {
+        // TODO: add a router_info entry for this router
+
+        // TODO: setup router specific API endpoint
+
+        let source_id = SourceId::from(addr);
+
+        let router_id = Arc::new(format_source_id(
+            &router_id_template.load(),
+            UNKNOWN_ROUTER_SYSNAME,
+            &source_id,
+        ));
+
+        // Choose a name to be reported in application logs.
+        let child_name = format!("router[{}]", source_id);
+
+        // Create a status reporter whose name in output will be a combination
+        // of ours as parent and the newly chosen child name, enabling logged
+        // messages relating to this newly connected router to be
+        // distinguished from logged messages relating to other connected
+        // routers.
+        let status_reporter = Arc::new(status_reporter.add_child(child_name));
+
+        let bmp_state = BmpState::new(
+            source_id.clone(),
+            router_id,
+            status_reporter.clone(),
+            bmp_metrics,
+        );
+
+        let bmp_state = Arc::new(RwLock::new(Some(bmp_state)));
+
+        let custom_state = BmpStreamState {
+            status_reporter,
+            source_id,
+            gate: gate.into(),
+            bmp_state,
+            router_id_template,
+            roto_scripts,
+            filter_name,
+            #[cfg(feature = "router-list")]
+            conn_summaries,
+        };
+
+        Ok(Some(custom_state))
     }
 
     #[allow(clippy::type_complexity)]
     fn call<SrvErr>(
-        self,
         addr: SocketAddr,
-        msg: <BmpBytes as MsgProvider>::Msg,
-    ) -> Result<Transaction<impl Future<Output = SrvOut>, Empty<SrvOut>>, ServiceError<SrvErr>>
-    {
-        self.status_reporter.bmp_message_received(addr);
-        let bmp_msg = Arc::new(BytesRecord(msg));
-        let value = TypeValue::Builtin(BuiltinTypeValue::BmpMessage(bmp_msg));
-        let payload = Payload::new(self.source_id.clone(), value);
-        Ok(Transaction::OrderedSingle(async move {
-            self.gate.update_data(payload.into()).await;
-            // This strange looking return error is a hack to say that there is no
-            // response message... TO DO: make a better API for this... sigh.
-            Err(ServiceError::ServiceSpecificError(()))
-        }))
+        msg: Message<Bytes>,
+        custom_state: Option<BmpStreamState>,
+    ) -> Result<
+        (
+            Transaction<impl Future<Output = SrvOut>, Empty<SrvOut>>,
+            Option<BmpStreamState>,
+        ),
+        ServiceError<SrvErr>,
+    > {
+        let custom_state = custom_state.unwrap();
+
+        {
+            let bmp_state_read_lock = custom_state.bmp_state.read().unwrap(); // SAFETY: should never be poisoned
+            let bmp_state = bmp_state_read_lock.as_ref().unwrap(); // SAFETY: should already have been set to Some by connect()
+
+            custom_state
+                .status_reporter
+                .bmp_message_received(bmp_state.router_id());
+        }
+
+        #[cfg(feature = "router-list")]
+        if let Some(conn_summary) = custom_state.conn_summaries.get(&addr) {
+            let mut guard = conn_summary.last_msg_at.write().unwrap();
+            *guard = Utc::now();
+        } else {
+            let now = Utc::now();
+            let conn_summary = ConnSummary {
+                connected_at: Arc::new(now.clone()),
+                last_msg_at: Arc::new(RwLock::new(now)),
+                bmp_state: Arc::downgrade(&custom_state.bmp_state),
+            };
+            custom_state.conn_summaries.insert(addr, conn_summary);
+        }
+
+        if let Ok(ControlFlow::Continue(FilterOutput { south, east })) = Self::VM.with(|vm| {
+            let value =
+                TypeValue::Builtin(BuiltinTypeValue::BmpMessage(Arc::new(BytesRecord(msg))));
+            custom_state
+                .roto_scripts
+                .exec(vm, &custom_state.filter_name.load(), value)
+        }) {
+            let gate = custom_state.gate.clone();
+            let mut south_update = None;
+            let mut east_update = None;
+
+            if !south.is_empty() {
+                south_update = Some(
+                    Payload::from_output_stream_queue(custom_state.source_id.clone(), south).into(),
+                );
+            }
+
+            if let TypeValue::Builtin(BuiltinTypeValue::BmpMessage(msg)) = east {
+                let msg = Arc::into_inner(msg).unwrap(); // This should succeed
+                let msg = msg.0;
+
+                let mut bmp_state_lock = custom_state.bmp_state.write().unwrap(); // SAFETY: should never be poisoned
+                let bmp_state = bmp_state_lock.take().unwrap();
+
+                custom_state
+                    .status_reporter
+                    .bmp_message_processed(bmp_state.router_id());
+
+                let mut res = bmp_state.process_msg(msg);
+
+                match res.processing_result {
+                    MessageType::InvalidMessage {
+                        err,
+                        known_peer,
+                        msg_bytes,
+                    } => {
+                        custom_state
+                            .status_reporter
+                            .invalid_bmp_message_received(res.next_state.router_id());
+                        if let Some(reporter) = res.next_state.status_reporter() {
+                            reporter.bgp_update_parse_hard_fail(
+                                res.next_state.router_id(),
+                                known_peer,
+                                err,
+                                msg_bytes,
+                            );
+                        }
+                    }
+
+                    MessageType::StateTransition => {
+                        // If we have transitioned to the Dumping state that means we
+                        // just processed an Initiation message and MUST have captured
+                        // a sysName Information TLV string. Use the captured value to
+                        // make the router ID more meaningful, instead of the
+                        // UNKNOWN_ROUTER_SYSNAME sysName value we used until now.
+                        Self::check_update_router_id(addr, &mut res.next_state, &custom_state);
+                    }
+
+                    MessageType::RoutingUpdate { update } => {
+                        // Pass the routing update on to downstream units and/or targets.
+                        // This is where we send an update down the pipeline.
+                        east_update = Some(update);
+                    }
+
+                    MessageType::Other => {
+                        // A BMP initiation message received after the initiation
+                        // phase will result in this type of message.
+                        Self::check_update_router_id(addr, &mut res.next_state, &custom_state);
+                    }
+
+                    MessageType::Aborted => {
+                        // Something went fatally wrong, the issue should already have
+                        // been logged so there's nothing more we can do here.
+                    }
+                }
+
+                *bmp_state_lock = Some(res.next_state);
+            }
+
+            let txn = Transaction::OrderedSingle(async move {
+                if let Some(update) = south_update {
+                    gate.update_data(update).await;
+                }
+                if let Some(update) = east_update {
+                    gate.update_data(update).await;
+                }
+
+                // This strange looking return error is a hack to say that there is no
+                // response message... TO DO: make a better API for this... sigh.
+                Err(ServiceError::ServiceSpecificError(()))
+            });
+
+            Ok((txn, Some(custom_state)))
+        } else {
+            // custom_state.status_reporter.bmp_message_filtered()
+            todo!()
+        }
     }
 
-    fn disconnect(self, addr: SocketAddr) {
-        self.status_reporter.router_connection_lost(addr)
+    fn disconnect(addr: SocketAddr, custom_state: Option<BmpStreamState>) {
+        // custom_state.status_reporter.router_connection_lost(addr)
+    }
+
+    fn check_update_router_id(
+        addr: SocketAddr,
+        next_state: &mut BmpState,
+        custom_state: &BmpStreamState,
+    ) {
+        let new_sys_name = match next_state {
+            BmpState::Dumping(v) => &v.details.sys_name,
+            BmpState::Updating(v) => &v.details.sys_name,
+            _ => {
+                // Other states don't carry the sys name
+                return;
+            }
+        };
+
+        let new_router_id = Arc::new(format_source_id(
+            &custom_state.router_id_template.load(),
+            new_sys_name,
+            &custom_state.source_id,
+        ));
+
+        let old_router_id = next_state.router_id();
+        if new_router_id != old_router_id {
+            // Ensure that on first use the metrics for this
+            // new router ID are correctly initialised.
+            custom_state
+                .status_reporter
+                .router_id_changed(old_router_id, new_router_id.clone());
+
+            match next_state {
+                BmpState::Dumping(v) => v.router_id = new_router_id.clone(),
+                BmpState::Updating(v) => v.router_id = new_router_id.clone(),
+                _ => unreachable!(),
+            }
+
+            #[cfg(feature = "router-list")]
+            if let Some(conn_summary) = custom_state.conn_summaries.get(&addr) {
+                let mut new_conn_summary = conn_summary.clone();
+                let (sys_name, sys_desc) = match next_state {
+                    BmpState::Dumping(v) => (&v.details.sys_name, &v.details.sys_desc),
+                    BmpState::Updating(v) => (&v.details.sys_name, &v.details.sys_desc),
+                    _ => unreachable!(),
+                };
+            }
+        }
     }
 }
 
@@ -172,7 +441,7 @@ impl BmpStreamHandler {
 
 #[async_trait::async_trait]
 trait TcpListenerFactory<T> {
-    async fn bind(&self, addr: String) -> std::io::Result<T>;
+    async fn bind(&self, addr: &str) -> std::io::Result<T>;
 }
 
 #[async_trait::async_trait]
@@ -184,7 +453,7 @@ struct StandardTcpListenerFactory;
 
 #[async_trait::async_trait]
 impl TcpListenerFactory<StandardTcpListener> for StandardTcpListenerFactory {
-    async fn bind(&self, addr: String) -> std::io::Result<StandardTcpListener> {
+    async fn bind(&self, addr: &str) -> std::io::Result<StandardTcpListener> {
         let listener = ::tokio::net::TcpListener::bind(addr).await?;
         Ok(StandardTcpListener(listener))
     }
@@ -215,26 +484,27 @@ impl AsyncAccept for StandardTcpListener {
     }
 }
 
-//--- BmpTcpIn ---------------------------------------------------------------
+//-------- BmpIn -------------------------------------------------------------
 
-/// An unit that receives incoming BMP data. For testing purposes you can
-/// stream from a captured BMP stream in PCAP format using a command like so:
-///     tshark -r <CAPTURED.pcap> -q -z follow,tcp,raw,0 | \
-///         grep -E '^[0-9a-z]+' | \
-///         xxd -r -p | \
-///         socat - TCP4:127.0.0.1:11019
-///
-/// On change: if in the config file the unit is renamed, commented out,
-///            deleted or no longer referenced it, AND any established
-///            connections with routers, will be terminated.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct BmpTcpIn {
     /// A colon separated IP address and port number to listen on for incoming
     /// BMP over TCP connections from routers.
     ///
     /// On change: existing connections to routers will be unaffected, new
     ///            connections will only be accepted at the changed URI.
-    pub listen: String,
+    pub listen: Arc<String>,
+
+    /// The relative path at which we should listen for HTTP query API requests
+    #[cfg(feature = "router-list")]
+    #[serde(default = "BmpTcpIn::default_http_api_path")]
+    http_api_path: Arc<String>,
+
+    #[serde(default = "BmpTcpIn::default_router_id_template")]
+    pub router_id_template: String,
+
+    #[serde(default)]
+    pub filter_name: FilterName,
 }
 
 impl BmpTcpIn {
@@ -243,102 +513,209 @@ impl BmpTcpIn {
         mut component: Component,
         gate: Gate,
         mut waitpoint: WaitPoint,
-    ) -> Result<(), crate::comms::Terminated> {
+    ) -> Result<(), Terminated> {
         let unit_name = component.name().clone();
 
-        // Setup metrics
-        let metrics = Arc::new(BmpTcpInMetrics::new(&gate));
-        component.register_metrics(metrics.clone());
+        // Setup our metrics
+        let bmp_in_metrics = Arc::new(BmpInMetrics::new(&gate));
+        component.register_metrics(bmp_in_metrics.clone());
 
-        // Setup status reporting
-        let status_reporter = Arc::new(BmpTcpInStatusReporter::new(&unit_name, metrics.clone()));
+        // Setup metrics to be updated by the BMP state machines that we use
+        // to make sense of the BMP data per router that supplies it.
+        let bmp_metrics = Arc::new(BmpMetrics::new());
+        component.register_metrics(bmp_metrics.clone());
 
-        // Wait for other components to be, and signal to other components that we are, ready to start. All units and
-        // targets start together, otherwise data passed from one component to another may be lost if the receiving
-        // component is not yet ready to accept it.
+        let state_machine_metrics = Arc::new(TokioTaskMetrics::new());
+        component.register_metrics(state_machine_metrics.clone());
+
+        // Setup our status reporting
+        let status_reporter =
+            Arc::new(BmpInStatusReporter::new(&unit_name, bmp_in_metrics.clone()));
+
+        // Setup REST API endpoint
+        #[cfg(feature = "router-list")]
+        let (_api_processor, conn_summaries) = {
+            let conn_summaries = Arc::new(FrimMap::default());
+
+            let processor = Arc::new(RouterListApi::new(
+                component.http_resources().clone(),
+                self.http_api_path.clone(),
+                bmp_in_metrics.clone(),
+                bmp_metrics.clone(),
+                conn_summaries.clone(),
+            ));
+
+            component.register_http_resource(processor.clone(), &self.http_api_path);
+
+            (processor, conn_summaries)
+        };
+
+        let roto_scripts = component.roto_scripts().clone();
+
+        // Wait for other components to be, and signal to other components
+        // that we are, ready to start. All units and targets start together,
+        // otherwise data passed from one component to another may be lost if
+        // the receiving component is not yet ready to accept it.
         gate.process_until(waitpoint.ready()).await?;
 
-        // Signal again once we are out of the process_until() so that anyone waiting to send important gate status
-        // updates won't send them while we are in process_until() which will just eat them without handling them.
+        // Signal again once we are out of the process_until() so that anyone
+        // waiting to send important gate status updates won't send them while
+        // we are in process_until() which will just eat them without handling
+        // them.
         waitpoint.running().await;
 
-        let service = BmpStreamHandler::new(
+        let router_id_template = Arc::new(ArcSwap::from_pointee(self.router_id_template.clone()));
+
+        let filter_name = Arc::new(ArcSwap::from_pointee(self.filter_name.clone()));
+
+        let service = BmpTcpStreamServiceFactory::build(
             gate.clone(),
+            bmp_metrics.clone(),
             status_reporter.clone(),
-            "dummy source id".into(),
+            router_id_template.clone(),
+            roto_scripts.clone(),
+            filter_name.clone(),
+            #[cfg(feature = "router-list")]
+            conn_summaries,
         );
-        BmpTcpInRunner::new(self, gate, metrics, status_reporter)
-            .run(Arc::new(StandardTcpListenerFactory), service.into())
-            .await
+
+        BmpInRunner::new(
+            self.listen.clone(),
+            self.http_api_path.clone(),
+            gate,
+            bmp_metrics,
+            bmp_in_metrics,
+            state_machine_metrics,
+            status_reporter,
+            roto_scripts,
+            router_id_template,
+            filter_name,
+        )
+        .run(Arc::new(StandardTcpListenerFactory), service.into())
+        .await
+    }
+
+    #[cfg(feature = "router-list")]
+    fn default_http_api_path() -> Arc<String> {
+        Arc::new("/routers/".to_string())
+    }
+
+    pub fn default_router_id_template() -> String {
+        "{sys_name}".to_string()
     }
 }
 
-struct BmpTcpInRunner {
-    bmp: BmpTcpIn,
-    gate: Gate,
-    metrics: Arc<BmpTcpInMetrics>,
-    status_reporter: Arc<BmpTcpInStatusReporter>,
+//-------- BytesBufSource ----------------------------------------------------
+
+struct BytesBufSource;
+
+impl BufSource for BytesBufSource {
+    type Output = BytesMut;
+
+    fn create_buf(&self) -> Self::Output {
+        BytesMut::new()
+    }
+
+    fn create_sized(&self, size: usize) -> Self::Output {
+        let mut buf = BytesMut::with_capacity(size);
+        buf.resize(size, 0);
+        buf
+    }
 }
 
-impl BmpTcpInRunner {
+//-------- BmpInRunner -------------------------------------------------------
+
+struct BmpInRunner {
+    listen: Arc<String>,
+    http_api_path: Arc<String>,
+    gate: Gate,
+    _bmp_metrics: Arc<BmpMetrics>,
+    _bmp_in_metrics: Arc<BmpInMetrics>,
+    _state_machine_metrics: Arc<TokioTaskMetrics>,
+    status_reporter: Arc<BmpInStatusReporter>,
+    roto_scripts: RotoScripts,
+    router_id_template: Arc<ArcSwap<String>>,
+    filter_name: Arc<ArcSwap<FilterName>>,
+}
+
+impl BmpInRunner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        bmp: BmpTcpIn,
+        listen: Arc<String>,
+        http_api_path: Arc<String>,
         gate: Gate,
-        metrics: Arc<BmpTcpInMetrics>,
-        status_reporter: Arc<BmpTcpInStatusReporter>,
+        bmp_metrics: Arc<BmpMetrics>,
+        bmp_in_metrics: Arc<BmpInMetrics>,
+        state_machine_metrics: Arc<TokioTaskMetrics>,
+        status_reporter: Arc<BmpInStatusReporter>,
+        roto_scripts: RotoScripts,
+        router_id_template: Arc<ArcSwap<String>>,
+        filter_name: Arc<ArcSwap<FilterName>>,
+
     ) -> Self {
-        BmpTcpInRunner {
-            bmp,
+        Self {
+            listen: listen,
+            http_api_path: http_api_path,
             gate,
-            metrics,
+            _bmp_metrics: bmp_metrics,
+            _bmp_in_metrics: bmp_in_metrics,
+            _state_machine_metrics: state_machine_metrics,
             status_reporter,
+            roto_scripts,
+            router_id_template,
+            filter_name,
         }
     }
 
-    async fn run<T, U, V, W>(
+    #[cfg(test)]
+    pub(crate) fn mock() -> (Self, crate::comms::GateAgent) {
+        let (gate, gate_agent) = Gate::new(0);
+
+        let runner = Self {
+            listen: Default::default(),
+            http_api_path: BmpTcpIn::default_http_api_path().into(),
+            gate,
+            _bmp_metrics: Default::default(),
+            _bmp_in_metrics: Default::default(),
+            _state_machine_metrics: Default::default(),
+            status_reporter: Default::default(),
+            roto_scripts: Default::default(),
+            router_id_template: Default::default(),
+            filter_name: Default::default(),
+        };
+
+        (runner, gate_agent)
+    }
+
+    async fn run<ListenerFactory, Listener, Svc, MsgTyp, CustomState>(
         mut self,
-        listener_factory: Arc<T>,
-        service_factory: Arc<V>,
+        listener_factory: Arc<ListenerFactory>,
+        service_factory: Arc<Svc>,
     ) -> Result<(), crate::comms::Terminated>
     where
-        T: TcpListenerFactory<U>,
-        U: TcpListener + std::marker::Send + AsyncAccept + 'static,
-        V: Service<<U as AsyncAccept>::Addr, W> + Send + Sync + 'static,
-        W: MsgProvider + Send + Sync + 'static,
-        <W as MsgProvider>::ReqOcts: std::convert::From<BytesMut> + Send + Sync,
-        <W as MsgProvider>::Msg: Send,
+        ListenerFactory: TcpListenerFactory<Listener>,
+        Listener: TcpListener + Send + AsyncAccept + 'static,
+        Svc: Service<<Listener as AsyncAccept>::Addr, MsgTyp, CustomState> + Send + Sync + 'static,
+        MsgTyp: MsgProvider + Send + Sync + 'static,
+        <MsgTyp as MsgProvider>::ReqOcts: std::convert::From<BytesMut> + Send + Sync,
+        <MsgTyp as MsgProvider>::Msg: Send,
+        CustomState: Send + Sync + 'static,
     {
-        struct BytesBufSource;
-
-        impl BufSource for BytesBufSource {
-            type Output = BytesMut;
-
-            fn create_buf(&self) -> Self::Output {
-                BytesMut::new()
-            }
-
-            fn create_sized(&self, size: usize) -> Self::Output {
-                let mut buf = BytesMut::with_capacity(size);
-                buf.resize(size, 0);
-                buf
-            }
-        }
-
         // Loop until terminated, accepting TCP connections from routers and
         // spawning tasks to handle them.
-        let status_reporter = self.status_reporter.clone();
+        // let status_reporter = self.status_reporter.clone();
         let buf_source = Arc::new(BytesBufSource);
 
         loop {
-            let listen_addr = self.bmp.listen.clone();
+            let listen_addr = self.listen.clone();
 
             let bind_with_backoff = || async {
                 let mut wait = 1;
                 loop {
-                    match listener_factory.bind(listen_addr.clone()).await {
-                        Err(err) => {
-                            let err = format!("{err}: Will retry in {wait} seconds.");
-                            status_reporter.bind_error(&listen_addr, &err);
+                    match listener_factory.bind(&listen_addr).await {
+                        Err(_err) => {
+                            // let err = format!("{err}: Will retry in {wait} seconds.");
+                            // status_reporter.bind_error(&listen_addr, &err);
                             sleep(Duration::from_secs(wait)).await;
                             wait *= 2;
                         }
@@ -353,7 +730,7 @@ impl BmpTcpInRunner {
                 ControlFlow::Break(Terminated) => return Err(Terminated),
             };
 
-            status_reporter.listener_listening(&listen_addr);
+            // status_reporter.listener_listening(&listen_addr);
 
             let srv = StreamServer::new(listener, buf_source.clone(), service_factory.clone());
             let srv = Arc::new(srv);
@@ -397,7 +774,12 @@ impl BmpTcpInRunner {
                 UnitActivity::GateStatusChanged(status, next_fut) => {
                     match status {
                         GateStatus::Reconfiguring {
-                            new_config: Unit::BmpTcpIn(new_unit),
+                            new_config: Unit::BmpTcpIn(BmpTcpIn {
+                                listen: new_listen,
+                                http_api_path: _http_api_path,
+                                router_id_template: new_router_id_template,
+                                filter_name: new_filter_name,
+                            }),
                         } => {
                             // Runtime reconfiguration of this unit has
                             // been requested. New connections will be
@@ -406,9 +788,11 @@ impl BmpTcpInRunner {
                             // router_handler() tasks will receive their
                             // own copy of this Reconfiguring status
                             // update and can react to it accordingly.
-                            let rebind = self.bmp.listen != new_unit.listen;
+                            let rebind = self.listen != new_listen;
 
-                            self.bmp = new_unit;
+                            self.listen = new_listen;
+                            self.filter_name.store(new_filter_name.into());
+                            self.router_id_template.store(new_router_id_template.into());
 
                             if rebind {
                                 // Trigger re-binding to the new listen port.
@@ -419,7 +803,7 @@ impl BmpTcpInRunner {
 
                         GateStatus::ReportLinks { report } => {
                             report.declare_source();
-                            report.set_graph_status(self.metrics.clone());
+                            // report.set_graph_status(self.metrics.clone());
                         }
 
                         _ => { /* Nothing to do */ }
@@ -429,7 +813,7 @@ impl BmpTcpInRunner {
                 }
 
                 UnitActivity::InputError(err) => {
-                    self.status_reporter.listener_io_error(&err);
+                    // self.status_reporter.listener_io_error(&err);
                     return ControlFlow::Continue(Err(err));
                 }
 
@@ -446,333 +830,155 @@ impl BmpTcpInRunner {
     }
 }
 
+impl std::fmt::Debug for BmpInRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BmpInRunner").finish()
+    }
+}
+
+// --- Tests ----------------------------------------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::SocketAddr,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
-
-    use futures::{stream::Empty, Future};
-    use serve::{
-        service::{MsgProvider, Service, ServiceError, Transaction},
-        sock::AsyncAccept,
-    };
-    use tokio::{
-        io::{AsyncRead, AsyncWrite},
-        net::TcpStream,
-        time::timeout,
-    };
+    use roto::types::{collections::BytesRecord, lazyrecord_types::BmpMessage};
 
     use crate::{
-        common::status_reporter::AnyStatusReporter,
-        comms::{Gate, GateAgent},
-        tests::util::internal::{enable_logging, get_testable_metrics_snapshot},
-        units::{
-            bmp_tcp_in::{
-                metrics::BmpTcpInMetrics,
-                status_reporter::BmpTcpInStatusReporter,
-                unit::{BmpTcpInRunner, SrvOut, TcpListener, TcpListenerFactory},
-            },
-            Unit,
+        bgp::encode::{
+            mk_initiation_msg, mk_invalid_initiation_message_that_lacks_information_tlvs,
+            mk_peer_down_notification_msg, mk_per_peer_header,
         },
+        tests::util::internal::get_testable_metrics_snapshot,
     };
 
-    use super::{BmpBytes, BmpTcpIn};
+    use super::*;
 
-    struct MockTcpListenerFactory<T>
-    where
-        T: Fn(String) -> std::io::Result<()> + Sync,
-    {
-        pub bind_cb: T,
-        pub binds: Arc<Mutex<Vec<String>>>,
+    const SYS_NAME: &str = "some sys name";
+    const SYS_DESCR: &str = "some sys descr";
+    const OTHER_SYS_NAME: &str = "other sys name";
+
+    #[test]
+    fn sources_are_required() {
+        // suppress the panic backtrace as we expect the panic
+        std::panic::set_hook(Box::new(|_| {}));
+
+        // parse and panic due to missing 'sources' field
+        assert!(mk_config_from_toml("").is_err());
     }
 
-    struct MockTcpListener;
-
-    impl<T> MockTcpListenerFactory<T>
-    where
-        T: Fn(String) -> std::io::Result<()> + Sync,
-    {
-        pub fn new(bind_cb: T) -> Self {
-            Self {
-                bind_cb,
-                binds: Arc::default(),
-            }
-        }
+    #[test]
+    fn sources_must_be_non_empty() {
+        assert!(mk_config_from_toml("sources = []").is_err());
     }
 
-    #[async_trait::async_trait]
-    impl<T> TcpListenerFactory<MockTcpListener> for MockTcpListenerFactory<T>
-    where
-        T: Fn(String) -> std::io::Result<()> + Sync,
-    {
-        async fn bind(&self, addr: String) -> std::io::Result<MockTcpListener> {
-            (self.bind_cb)(addr.clone())?;
-            self.binds.lock().unwrap().push(addr);
-            Ok(MockTcpListener)
-        }
+    #[test]
+    fn okay_with_one_source() {
+        let toml = r#"
+        sources = ["some source"]
+        "#;
+
+        mk_config_from_toml(toml).unwrap();
     }
 
-    #[async_trait::async_trait]
-    impl TcpListener for MockTcpListener {
-        async fn accept(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
-            // block forever
-            std::future::pending().await
-        }
-    }
+    // Note: The tests below assume that the default router id template
+    // includes the BMP sysName.
 
-    struct MockStreamType;
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic]
+    async fn counters_for_expected_sys_name_should_not_exist() {
+        let (runner, _) = BmpInRunner::mock();
+        let initiation_msg = mk_update(mk_initiation_msg(SYS_NAME, SYS_DESCR));
 
-    impl AsyncWrite for MockStreamType {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &[u8],
-        ) -> std::task::Poll<Result<usize, std::io::Error>> {
-            todo!()
-        }
+        runner.process_update(initiation_msg).await;
 
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
-            todo!()
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
-            todo!()
-        }
-    }
-
-    impl AsyncRead for MockStreamType {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            todo!()
-        }
-    }
-
-    impl AsyncAccept for MockTcpListener {
-        type Addr = ();
-
-        type Error = ();
-
-        type StreamType = MockStreamType;
-
-        type Stream = futures::future::Ready<Result<Self::StreamType, Self::Error>>;
-
-        fn poll_accept(
-            &self,
-            _cx: &mut std::task::Context,
-        ) -> std::task::Poll<Result<(Self::Stream, Self::Addr), std::io::Error>> {
-            std::task::Poll::Pending
-        }
-    }
-
-    fn noop_service_factory() -> impl Service<(), BmpBytes> {
-        #[allow(clippy::type_complexity)]
-        fn service<SrvErr>(
-            _msg: <BmpBytes as MsgProvider>::Msg,
-        ) -> Result<Transaction<impl Future<Output = SrvOut>, Empty<SrvOut>>, ServiceError<SrvErr>>
-        {
-            Ok(Transaction::Single(async move {
-                Err(ServiceError::ServiceSpecificError(()))
-            }))
-        }
-
-        move |_addr, msg| service(msg)
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_reconfigured_bind_address() {
-        // Given an instance of the BMP TCP input unit that is configured to
-        // listen for incoming connections on "localhost:8080":
-        let (runner, agent) = setup_test("localhost:8080");
-        let status_reporter = runner.status_reporter.clone();
-        let mock_listener_factory = Arc::new(MockTcpListenerFactory::new(|_| Ok(())));
-        let task = runner.run(mock_listener_factory.clone(), noop_service_factory().into());
-        let join_handle = tokio::task::spawn(task);
-
-        // Allow time for bind attempts to occur
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // When the unit is reconfigured to listen for incoming connections on
-        // "otherhost:8081":
-        let (new_gate, new_agent) = Gate::new(1);
-        let new_config = BmpTcpIn {
-            listen: "otherhost:8081".to_string(),
-        };
-        let new_config = Unit::BmpTcpIn(new_config);
-        agent.reconfigure(new_config, new_gate).await.unwrap();
-
-        // Allow time for bind attempts to occur
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Then send a termination command to the gate:
-        assert!(!join_handle.is_finished());
-        new_agent.terminate().await;
-        let _ = timeout(Duration::from_millis(100), join_handle)
-            .await
-            .unwrap();
-
-        // And verify that the unit bound first to the first given URI and
-        // then to the second given URI and not to any other URI.
-        let binds = mock_listener_factory.binds.lock().unwrap();
-        assert_eq!(binds.len(), 2);
-        assert_eq!(binds[0], "localhost:8080");
-        assert_eq!(binds[1], "otherhost:8081");
-
-        let metrics = get_testable_metrics_snapshot(&status_reporter.metrics().unwrap());
+        let metrics = get_testable_metrics_snapshot(&runner.status_reporter.metrics().unwrap());
         assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"),
-            2
-        );
-        assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"),
-            0
-        );
-        assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"),
-            0
+            metrics.with_label::<usize>("bmp_in_num_invalid_bmp_messages", ("router", SYS_NAME)),
+            0,
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_unchanged_bind_address() {
-        // Given an instance of the BMP TCP input unit that is configured to
-        // listen for incoming connections on "localhost:8080":
-        let (runner, agent) = setup_test("localhost:8080");
-        let status_reporter = runner.status_reporter.clone();
-        let mock_listener_factory = Arc::new(MockTcpListenerFactory::new(|_| Ok(())));
-        let task = runner.run(mock_listener_factory.clone(), noop_service_factory().into());
-        let join_handle = tokio::task::spawn(task);
+    #[tokio::test(flavor = "multi_thread")]
+    #[should_panic]
+    async fn counters_for_other_sys_name_should_not_exist() {
+        let (runner, _) = BmpInRunner::mock();
+        let initiation_msg = mk_update(mk_initiation_msg(SYS_NAME, SYS_DESCR));
 
-        // Allow time for bind attempts to occur
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        runner.process_update(initiation_msg).await;
 
-        // When the unit is reconfigured to listen for incoming connections on
-        // an unchanged listen address:
-        let (new_gate, new_agent) = Gate::new(1);
-        let new_config = BmpTcpIn {
-            listen: "localhost:8080".to_string(),
-        };
-        let new_config = Unit::BmpTcpIn(new_config);
-        agent.reconfigure(new_config, new_gate).await.unwrap();
-
-        // Allow time for bind attempts to occur
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Then send a termination command to the gate:
-        assert!(!join_handle.is_finished());
-        new_agent.terminate().await;
-        let _ = timeout(Duration::from_millis(100), join_handle)
-            .await
-            .unwrap();
-
-        // And verify that the unit bound only once and only to the given URI:
-        let binds = mock_listener_factory.binds.lock().unwrap();
-        assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0], "localhost:8080");
-
-        let metrics = get_testable_metrics_snapshot(&status_reporter.metrics().unwrap());
+        let metrics = get_testable_metrics_snapshot(&runner.status_reporter.metrics().unwrap());
         assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"),
-            1
-        );
-        assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"),
-            0
-        );
-        assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"),
-            0
+            metrics.with_label::<usize>(
+                "bmp_in_num_invalid_bmp_messages",
+                ("router", OTHER_SYS_NAME)
+            ),
+            0,
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn test_overcoming_bind_failure() {
-        // Given an instance of the BMP TCP input unit that is configured to
-        // listen for incoming connections on "localhost:8080":
-        let fail_on_bad_addr = |addr| {
-            if addr != "idontexist:-1" {
-                Ok(())
-            } else {
-                Err(std::io::ErrorKind::PermissionDenied.into())
-            }
-        };
-        let (runner, agent) = setup_test("idontexist:-1");
-        let status_reporter = runner.status_reporter.clone();
-        let mock_listener_factory = Arc::new(MockTcpListenerFactory::new(fail_on_bad_addr));
-        let task = runner.run(mock_listener_factory.clone(), noop_service_factory().into());
-        let join_handle = tokio::task::spawn(task);
+    #[tokio::test(flavor = "multi_thread")]
+    async fn num_invalid_bmp_messages_counter_should_increase() {
+        let (runner, _) = BmpInRunner::mock();
 
-        // Allow time for bind attempts to occur
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // A BMP Initiation message that lacks required fields
+        let bad_initiation_msg =
+            mk_update(mk_invalid_initiation_message_that_lacks_information_tlvs());
 
-        // When the unit is reconfigured to listen for incoming connections on
-        // an unchanged listen address:
-        let (new_gate, new_agent) = Gate::new(1);
-        let new_config = BmpTcpIn {
-            listen: "localhost:8080".to_string(),
-        };
-        let new_config = Unit::BmpTcpIn(new_config);
-        agent.reconfigure(new_config, new_gate).await.unwrap();
+        // A BMP Peer Down Notification message without a corresponding Peer
+        // Up Notification message.
+        let pph = mk_per_peer_header("10.0.0.1", 12345);
+        let bad_peer_down_msg = mk_update(mk_peer_down_notification_msg(&pph));
 
-        // Allow time for bind attempts to occur
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        runner.process_update(bad_initiation_msg).await;
+        runner.process_update(bad_peer_down_msg).await;
 
-        // Then send a termination command to the gate:
-        assert!(!join_handle.is_finished());
-        new_agent.terminate().await;
-        let _ = timeout(Duration::from_millis(100), join_handle)
-            .await
-            .unwrap();
-
-        // And verify that the unit bound only once and only to the given URI:
-        let binds = mock_listener_factory.binds.lock().unwrap();
-        assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0], "localhost:8080");
-
-        let metrics = get_testable_metrics_snapshot(&status_reporter.metrics().unwrap());
+        let metrics = get_testable_metrics_snapshot(&runner.status_reporter.metrics().unwrap());
         assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_listener_bound_count"),
-            1
-        );
-        assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_connection_accepted_count"),
-            0
-        );
-        assert_eq!(
-            metrics.with_name::<usize>("bmp_tcp_in_connection_lost_count"),
-            0
+            metrics.with_label::<usize>(
+                "bmp_in_num_invalid_bmp_messages",
+                ("router", UNKNOWN_ROUTER_SYSNAME)
+            ),
+            2,
         );
     }
 
-    //-------- Test helpers --------------------------------------------------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_counters_should_be_started_if_the_router_id_changes() {
+        let (runner, _) = BmpInRunner::mock();
+        let initiation_msg = mk_update(mk_initiation_msg(SYS_NAME, SYS_DESCR));
+        let pph = mk_per_peer_header("10.0.0.1", 12345);
+        let bad_peer_down_msg = mk_update(mk_peer_down_notification_msg(&pph));
+        let reinitiation_msg = mk_update(mk_initiation_msg(OTHER_SYS_NAME, SYS_DESCR));
+        let another_bad_peer_down_msg = mk_update(mk_peer_down_notification_msg(&pph));
 
-    fn setup_test(listen: &str) -> (BmpTcpInRunner, GateAgent) {
-        enable_logging("trace");
+        runner.process_update(initiation_msg).await;
+        runner.process_update(bad_peer_down_msg).await;
+        runner.process_update(reinitiation_msg).await;
+        runner.process_update(another_bad_peer_down_msg).await;
 
-        let (gate, gate_agent) = Gate::new(0);
-        let bmp = BmpTcpIn {
-            listen: listen.to_string(),
-        };
-        let metrics = Arc::new(BmpTcpInMetrics::default());
-        let status_reporter = Arc::new(BmpTcpInStatusReporter::default());
-        let runner = BmpTcpInRunner {
-            bmp,
-            gate,
-            metrics,
-            status_reporter,
-        };
+        let metrics = get_testable_metrics_snapshot(&runner.status_reporter.metrics().unwrap());
+        assert_eq!(
+            metrics.with_label::<usize>("bmp_in_num_invalid_bmp_messages", ("router", SYS_NAME)),
+            1,
+        );
+        assert_eq!(
+            metrics.with_label::<usize>(
+                "bmp_in_num_invalid_bmp_messages",
+                ("router", OTHER_SYS_NAME)
+            ),
+            1,
+        );
+    }
 
-        (runner, gate_agent)
+    // --- Test helpers ------------------------------------------------------
+
+    fn mk_config_from_toml(toml: &str) -> Result<BmpTcpIn, toml::de::Error> {
+        toml::from_str::<BmpTcpIn>(toml)
+    }
+
+    fn mk_update(msg_buf: Bytes) -> Update {
+        let source_id = SourceId::SocketAddr("127.0.0.1:8080".parse().unwrap());
+        let bmp_msg = Arc::new(BytesRecord(BmpMessage::from_octets(msg_buf).unwrap()));
+        let value = TypeValue::Builtin(BuiltinTypeValue::BmpMessage(bmp_msg));
+        Update::Single(Payload::new(source_id, value))
     }
 }

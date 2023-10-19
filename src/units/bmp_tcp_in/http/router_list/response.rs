@@ -1,11 +1,14 @@
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    net::SocketAddr,
+    sync::{atomic::Ordering, Arc}, ops::Deref,
+};
 
 use hyper::{Body, Response};
 use indoc::formatdoc;
 
 use crate::{
     payload::SourceId,
-    units::bmp_in::{
+    units::bmp_tcp_in::{
         state_machine::machine::{BmpState, BmpStateDetails},
         util::{calc_u8_pc, format_source_id},
     },
@@ -18,7 +21,7 @@ const MAX_INFO_TLV_LEN: usize = 60;
 impl RouterListApi {
     pub async fn build_response(
         &self,
-        keys: Vec<SourceId>,
+        keys: Vec<SocketAddr>,
         http_api_path: std::borrow::Cow<'_, str>,
     ) -> Response<Body> {
         let mut response_body = self.build_response_header(&keys);
@@ -34,7 +37,7 @@ impl RouterListApi {
             .unwrap()
     }
 
-    fn build_response_header(&self, keys: &[SourceId],) -> String {
+    fn build_response_header(&self, keys: &[SocketAddr]) -> String {
         formatdoc! {
             r#"
             <!DOCTYPE html>
@@ -76,37 +79,34 @@ impl RouterListApi {
 
     async fn build_response_body(
         &self,
-        keys: &[SourceId],
+        keys: &[SocketAddr],
         http_api_path: std::borrow::Cow<'_, str>,
         response_body: &mut String,
     ) {
         for addr in keys.iter() {
-            if let Some(state_machine) = self.router_states.get(addr) {
-                let locked = state_machine.lock().await;
-                let (sys_name, sys_desc) = if let Some(sm) = locked.as_ref() {
-                    match sm {
-                        BmpState::Dumping(BmpStateDetails { details, .. }) => {
-                            (Some(&details.sys_name), Some(&details.sys_desc))
+            if let Some(conn_summary) = self.conn_summaries.get(addr) {
+                if let Some(bmp_state_locked) = conn_summary.bmp_state.upgrade() {
+                    let bmp_state = bmp_state_locked.read().unwrap();
+    
+                    let details = match bmp_state.deref() {
+                        Some(BmpState::Dumping(v)) => {
+                            Some((v.router_id.clone(), v.details.sys_name.clone(), v.details.sys_desc.clone()))
                         }
-                        BmpState::Updating(BmpStateDetails { details, .. }) => {
-                            (Some(&details.sys_name), Some(&details.sys_desc))
+                        Some(BmpState::Updating(v)) => {
+                            Some((v.router_id.clone(), v.details.sys_name.clone(), v.details.sys_desc.clone()))
                         }
                         _ => {
                             // no TLVs available
-                            (None, None)
+                            None
                         }
-                    }
-                } else {
-                    (None, None)
-                };
+                    };
 
-                let fragment = match (sys_name, sys_desc) {
-                    (Some(sys_name), Some(sys_desc)) => {
+                    let fragment = if let Some((router_id, sys_name, sys_desc)) = details {
                         // Don't trust external input, it could contain HTML
                         // or JavaScript which when we output it would be
                         // rendered in the client browser.
-                        let sys_name = html_escape::encode_safe(&sys_name);
-                        let sys_desc = html_escape::encode_safe(&sys_desc);
+                        let sys_name = html_escape::encode_safe(sys_name.as_str());
+                        let sys_desc = html_escape::encode_safe(sys_desc.as_str());
 
                         let sys_name = if sys_name.len() > MAX_INFO_TLV_LEN {
                             &sys_name[0..=MAX_INFO_TLV_LEN]
@@ -119,25 +119,19 @@ impl RouterListApi {
                             &sys_desc[..]
                         };
 
-                        let router_id = Arc::new(format_source_id(
-                            self.router_id_template.clone(),
-                            sys_name,
-                            addr,
-                        ));
                         let metrics = self.bmp_metrics.router_metrics(router_id.clone());
 
                         let state = metrics.bmp_state_machine_state.load(Ordering::SeqCst);
                         let num_peers_up = metrics.num_peers_up.load(Ordering::SeqCst);
                         let num_peers_up_eor_capable =
                             metrics.num_peers_up_eor_capable.load(Ordering::SeqCst);
-                        let num_peers_up_dumping =
-                            metrics.num_peers_up_dumping.load(Ordering::SeqCst);
+                        let num_peers_up_dumping = metrics.num_peers_up_dumping.load(Ordering::SeqCst);
                         let num_peers_up_eor_capable_pc =
                             calc_u8_pc(num_peers_up, num_peers_up_eor_capable);
                         let num_peers_up_dumping_pc =
                             calc_u8_pc(num_peers_up_eor_capable, num_peers_up_dumping);
-                        let num_invalid_bmp_messages = if self.router_metrics.contains(&router_id) {
-                            self.router_metrics
+                        let num_invalid_bmp_messages = if self.bmp_in_metrics.contains(&router_id) {
+                            self.bmp_in_metrics
                                 .router_metrics(router_id)
                                 .num_invalid_bmp_messages
                                 .load(Ordering::SeqCst)
@@ -150,20 +144,24 @@ impl RouterListApi {
                             + metrics
                                 .num_bgp_updates_with_recoverable_parsing_failures_for_unknown_peers
                                 .load(Ordering::SeqCst);
-                        let num_hard_parsing_failures = metrics.num_bgp_updates_with_unrecoverable_parsing_failures_for_known_peers.load(Ordering::SeqCst) +
-                            metrics.num_bgp_updates_with_unrecoverable_parsing_failures_for_unknown_peers.load(Ordering::SeqCst);
+                        let num_hard_parsing_failures = metrics
+                            .num_bgp_updates_with_unrecoverable_parsing_failures_for_known_peers
+                            .load(Ordering::SeqCst)
+                            + metrics
+                                .num_bgp_updates_with_unrecoverable_parsing_failures_for_unknown_peers
+                                .load(Ordering::SeqCst);
 
                         formatdoc! {
                             r#"
-                                            <tr>
-                                                <td><a href="{}{}">{}</a></td>
-                                                <td><a href="{}{}">{}</a></td>
-                                                <td>{}</td>
-                                                <td>{}</td>
-                                                <td>{}/{} ({}%)/{} ({}%)</td>
-                                                <td>{} ({}/{})</td>
-                                            </tr>
-                                        "#,
+                                <tr>
+                                    <td><a href="{}{}">{}</a></td>
+                                    <td><a href="{}{}">{}</a></td>
+                                    <td>{}</td>
+                                    <td>{}</td>
+                                    <td>{}/{} ({}%)/{} ({}%)</td>
+                                    <td>{} ({}/{})</td>
+                                </tr>
+                            "#,
                             http_api_path,
                             addr,
                             addr,
@@ -181,9 +179,7 @@ impl RouterListApi {
                             num_soft_parsing_failures,
                             num_hard_parsing_failures,
                         }
-                    }
-
-                    _ => {
+                    } else {
                         formatdoc! {
                             r#"
                                             <tr>
@@ -197,10 +193,10 @@ impl RouterListApi {
                                         "#,
                             http_api_path, addr, addr
                         }
-                    }
-                };
-
-                response_body.push_str(&fragment);
+                    };
+    
+                    response_body.push_str(&fragment);
+                }
             }
         }
     }

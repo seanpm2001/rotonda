@@ -1,102 +1,81 @@
 use std::{
     fmt::Display,
-    net::SocketAddr,
-    sync::{
-        atomic::Ordering::{self, Relaxed},
-        Arc,
-    },
+    sync::{atomic::Ordering, Arc}, net::SocketAddr,
 };
 
-use log::{debug, info, warn};
+use log::{debug, error};
 
-use crate::common::status_reporter::{
-    sr_log, AnyStatusReporter, Chainable, Named, UnitStatusReporter,
+use crate::{
+    common::status_reporter::{sr_log, AnyStatusReporter, Chainable, Named, UnitStatusReporter},
+    payload::RouterId,
 };
 
-use super::metrics::BmpTcpInMetrics;
+use super::metrics::BmpInMetrics;
 
 #[derive(Debug, Default)]
-pub struct BmpTcpInStatusReporter {
+pub struct BmpInStatusReporter {
     name: String,
-    metrics: Arc<BmpTcpInMetrics>,
+    metrics: Arc<BmpInMetrics>,
 }
 
-impl BmpTcpInStatusReporter {
-    pub fn new<T: Display>(name: T, metrics: Arc<BmpTcpInMetrics>) -> Self {
+impl BmpInStatusReporter {
+    pub fn new<T: Display>(name: T, metrics: Arc<BmpInMetrics>) -> Self {
         Self {
             name: format!("{}", name),
             metrics,
         }
     }
 
-    pub fn bind_error<T: Display>(&self, listen_addr: &str, err: T) {
-        sr_log!(warn: self, "Error while listening for connections on {}: {}", listen_addr, err);
+    #[cfg(feature = "router-list")]
+    pub fn typed_metrics(&self) -> Arc<BmpInMetrics> {
+        self.metrics.clone()
     }
 
-    pub fn listener_listening(&self, server_uri: &str) {
-        sr_log!(info: self, "Listening for connections on {}", server_uri);
-        self.metrics.listener_bound_count.fetch_add(1, Relaxed);
+    pub fn router_id_changed(&self, old_router_id: Arc<RouterId>, new_router_id: Arc<RouterId>) {
+        sr_log!(debug: self, "Router id changed from '{}' to '{}'", old_router_id, new_router_id);
     }
 
-    pub fn listener_connection_accepted(&self, router_addr: SocketAddr) {
-        sr_log!(debug: self, "Router connected from {}", router_addr);
-        self.metrics.connection_accepted_count.fetch_add(1, Relaxed);
-    }
-
-    pub fn listener_io_error<T: Display>(&self, err: T) {
-        sr_log!(warn: self, "Error while listening for connections: {}", err);
-    }
-
-    pub fn receive_io_error<T: Display>(&self, router_addr: SocketAddr, err: T) {
-        sr_log!(warn: self, "Error while receiving BMP messages: {}", err);
+    pub fn bmp_message_received(&self, router_id: Arc<RouterId>) {
         self.metrics
-            .router_metrics(router_addr)
-            .num_receive_io_errors
-            .fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Ensure only when necessary that metric counters for a new (or changed)
-    /// router ID are initialised.
-    ///
-    /// This must be called prior to calling any other member function that
-    /// takes a [RouterId] as input otherwise metrics will not be properly
-    /// counted.
-    pub fn router_id_changed(&self, router_addr: SocketAddr) {
-        self.metrics
-            .router_metrics(router_addr)
-            .connection_count
-            .fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub fn bmp_message_received(&self, router_addr: SocketAddr) {
-        self.metrics
-            .router_metrics(router_addr)
+            .router_metrics(router_id)
             .num_bmp_messages_received
             .fetch_add(1, Ordering::SeqCst);
     }
 
-    pub fn router_connection_lost(&self, router_addr: SocketAddr) {
-        sr_log!(debug: self, "Router connection lost: {}", router_addr);
-        self.metrics.connection_lost_count.fetch_add(1, Relaxed);
-        self.metrics.remove_router(router_addr);
+    pub fn bmp_message_processed(&self, router_id: Arc<RouterId>) {
+        self.metrics
+            .router_metrics(router_id)
+            .num_bmp_messages_received
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn invalid_bmp_message_received(&self, router_id: Arc<RouterId>) {
+        self.metrics
+            .router_metrics(router_id)
+            .num_invalid_bmp_messages
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn internal_error<T: Display>(&self, err: T) {
+        sr_log!(error: self, "Internal error: {}", err);
     }
 }
 
-impl UnitStatusReporter for BmpTcpInStatusReporter {}
+impl UnitStatusReporter for BmpInStatusReporter {}
 
-impl AnyStatusReporter for BmpTcpInStatusReporter {
+impl AnyStatusReporter for BmpInStatusReporter {
     fn metrics(&self) -> Option<Arc<dyn crate::metrics::Source>> {
         Some(self.metrics.clone())
     }
 }
 
-impl Chainable for BmpTcpInStatusReporter {
+impl Chainable for BmpInStatusReporter {
     fn add_child<T: Display>(&self, child_name: T) -> Self {
         Self::new(self.link_names(child_name), self.metrics.clone())
     }
 }
 
-impl Named for BmpTcpInStatusReporter {
+impl Named for BmpInStatusReporter {
     fn name(&self) -> &str {
         &self.name
     }

@@ -203,26 +203,11 @@ mod tests {
         [units.bmp-tcp-in]
         type = "bmp-tcp-in"
         listen = "127.0.0.1:11019"
-
-        [targets.logger]
-        type = "bmp-fs-out"
-        sources = ["filter"]
-        path = "/tmp/bmp.log"
-        mode = "merge"
-        format = "log"
-
-        [units.filter]
-        type = "filter"
-        sources = ["bmp-tcp-in"]
         filter_name = "bmp-in-filter"
-
-        [units.routers]
-        type = "bmp-in"
-        sources = ["filter"]
 
         [units.global-rib]
         type = "rib"
-        sources = ["routers"]
+        sources = ["bmp-tcp-in"] #["routers"]
         filter_names = ["my-module", "my-module", "my-module"]
 
         [targets.dummy-null]
@@ -233,7 +218,7 @@ mod tests {
         let null_target_toml = r#"
         [targets.null]
         type = "null-out"
-        sources = ["global-rib", "filter"]
+        sources = ["global-rib"]
         "#;
 
         let mqtt_target_toml = r#"
@@ -322,7 +307,7 @@ mod tests {
 
             eprintln!("Subscribed to MQTT broker, sending BMP messages...");
             let mut bmp_conn = wait_for_bmp_connect().await;
-            let local_addr = format!("{}", bmp_conn.local_addr().unwrap());
+            // let local_addr = format!("{}", bmp_conn.local_addr().unwrap());
             let sys_name = bmp_initiate(&mut bmp_conn).await;
             bmp_peer_up(&mut bmp_conn).await;
             bmp_route_announce(&mut bmp_conn, test_prefix).await;
@@ -334,20 +319,6 @@ mod tests {
                 "num_updates_total",
                 Some(("component", "bmp-tcp-in")),
                 3,
-            )
-            .await;
-            assert_metric_eq(
-                manager.metrics(),
-                "num_updates_total",
-                Some(("component", "filter")),
-                3,
-            )
-            .await;
-            assert_metric_eq(
-                manager.metrics(),
-                "num_updates_total",
-                Some(("component", "routers")),
-                1,
             )
             .await;
             assert_metric_eq(
@@ -370,7 +341,7 @@ mod tests {
             assert_metric_eq(
                 manager.metrics(),
                 "bmp_tcp_in_num_bmp_messages_received_total",
-                Some(("router", &local_addr)),
+                Some(("router", "my-sys-name")),
                 3,
             )
             .await;
@@ -381,13 +352,13 @@ mod tests {
                 1,
             )
             .await;
-            assert_metric_eq(
-                manager.metrics(),
-                "roto_filter_num_filtered_messages_total",
-                Some(("component", "filter")),
-                0,
-            )
-            .await;
+            // assert_metric_eq(
+            //     manager.metrics(),
+            //     "roto_filter_num_filtered_messages_total",
+            //     Some(("component", "filter")),
+            //     0,
+            // )
+            // .await;
 
             // query the route to make sure it was stored
             eprintln!("Querying prefix store...");
@@ -449,20 +420,20 @@ mod tests {
                 4,
             )
             .await;
-            assert_metric_eq(
-                manager.metrics(),
-                "num_updates_total",
-                Some(("component", "filter")),
-                4,
-            )
-            .await;
-            assert_metric_eq(
-                manager.metrics(),
-                "num_updates_total",
-                Some(("component", "routers")),
-                2,
-            )
-            .await;
+            // assert_metric_eq(
+            //     manager.metrics(),
+            //     "num_updates_total",
+            //     Some(("component", "filter")),
+            //     4,
+            // )
+            // .await;
+            // assert_metric_eq(
+            //     manager.metrics(),
+            //     "num_updates_total",
+            //     Some(("component", "routers")),
+            //     2,
+            // )
+            // .await;
             assert_metric_eq(
                 manager.metrics(),
                 "num_updates_total",
@@ -475,7 +446,7 @@ mod tests {
             assert_metric_eq(
                 manager.metrics(),
                 "bmp_tcp_in_num_bmp_messages_received_total",
-                Some(("router", &local_addr)),
+                Some(("router", "my-sys-name")),
                 4,
             )
             .await;
