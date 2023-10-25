@@ -155,18 +155,28 @@ pub struct CombinedConfig {
 }
 
 impl CombinedConfig {
-    pub fn new(
+    pub fn new(my_asn: Asn, my_bgp_id: [u8; 4], peer_config: PeerConfig, remote_prefix_or_exact: PrefixOrExact) -> Self{
+        Self {
+            my_asn,
+            my_bgp_id,
+            remote_prefix_or_exact,
+            peer_config,
+        }
+    }
+
+    pub fn from_config(
         b: BgpTcpIn,
         peer_config: PeerConfig,
         remote_prefix_or_exact: PrefixOrExact,
-    ) -> CombinedConfig {
-        CombinedConfig {
+    ) -> Self {
+        Self {
             my_asn: b.my_asn,
             my_bgp_id: b.my_bgp_id,
             remote_prefix_or_exact,
             peer_config,
         }
     }
+
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config
     }

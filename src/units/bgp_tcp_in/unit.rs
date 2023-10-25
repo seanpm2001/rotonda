@@ -1,21 +1,29 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use futures::future::select;
+use arc_swap::ArcSwap;
+use bytes::{Bytes, BytesMut};
+use futures::future::{select, Either};
+use futures::stream::Empty;
 use futures::{pin_mut, Future};
 use log::debug;
-use rotonda_fsm::bgp::session::Command;
+use rotonda_fsm::bgp::session::{Command, Session, BgpConfig};
 use routecore::asn::Asn;
+use routecore::bgp::message::{Message, SessionConfig};
 use serde::Deserialize;
+use serve::ShortBuf;
+use serve::service::{Service, Transaction, CallResult, ServiceError};
+use serve::service::{MsgLayout::{self, MsgContainsLen}, MsgProvider};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::{pin, time};
+use tokio::sync::{mpsc, Notify};
 use tokio::time::sleep;
 
 use crate::common::roto::{FilterName, RotoScripts};
-use crate::common::status_reporter::{Chainable, UnitStatusReporter};
+use crate::common::status_reporter::Chainable;
 use crate::common::unit::UnitActivity;
 use crate::comms::{GateStatus, Terminated};
 use crate::manager::{Component, WaitPoint};
@@ -26,6 +34,209 @@ use super::router_handler::handle_connection;
 use super::status_reporter::BgpTcpInStatusReporter;
 
 use super::peer_config::{CombinedConfig, PeerConfigs};
+
+//------------ XXXX ----------------------------------------------------------
+
+struct BgpBytes(Message<Bytes>);
+
+impl MsgProvider for BgpBytes {
+    // According to RFC 4271 "BGP-4" one must read 18 bytes of an incoming
+    // message in order to know how many more bytes remain to be read.
+    ///
+    /// 4.1.  Message Header Format
+    ///
+    /// Each message has a fixed-size header.  There may or may not be a data
+    /// portion following the header, depending on the message type.  The
+    /// layout of these fields is shown below:
+    ///
+    ///    0                   1                   2                   3
+    ///    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    ///    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    ///    |                                                               |
+    ///    +                                                               +
+    ///    |                                                               |
+    ///    +                                                               +
+    ///    |                           Marker                              |
+    ///    +                                                               +
+    ///    |                                                               |
+    ///    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    ///    |          Length               |      Type     |
+    ///    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    ///
+    ///    Marker:
+    ///
+    ///       This 16-octet field is included for compatibility; it MUST be
+    ///       set to all ones.
+    ///
+    ///    Length:
+    ///
+    ///       This 2-octet unsigned integer indicates the total length of the
+    ///       message, including the header in octets.  Thus, it allows one
+    ///       to locate the (Marker field of the) next message in the TCP
+    ///       stream.  The value of the Length field MUST always be at least
+    ///       19 and no greater than 4096, and MAY be further constrained,
+    ///       depending on the message type.  "padding" of extra data after
+    ///       the message is not allowed.  Therefore, the Length field MUST
+    ///       have the smallest value required, given the rest of the
+    ///       message.
+    ///
+    /// From: https://datatracker.ietf.org/doc/html/rfc4271#section-4.1
+    const MIN_HDR_BYTES: usize = 18;
+
+    /// And thus we also know that the message length bytes are part of the
+    /// actual BMP message that we want to have as the output of deserializing
+    /// a complete BMP message byte sequence.
+    const MSG_LAYOUT: MsgLayout = MsgContainsLen;
+
+    /// Process incoming Bytes.
+    type ReqOcts = Bytes;
+
+    /// And deserialize them to BGP 'Message' objects that refer to those
+    /// read bytes.
+    type Msg = Message<Self::ReqOcts>;
+
+    fn len(hdr_buf: &[u8]) -> usize {
+        let _marker = &hdr_buf[0..16];
+        // SAFETY: we should only be invoked once MSG_HDR_BYTES worth of bytes
+        // have already been read and so should be safe to index into at least
+        // that many bytes of the given header buffer.
+        u32::from_be_bytes(hdr_buf[16..18].try_into().unwrap()) as usize
+    }
+
+    fn from_octets(octets: Self::ReqOcts) -> Result<Self::Msg, serve::ShortBuf> {
+        // TODO: The SessionConfig needs to be updated based on the
+        // exchanged BGP OPENs
+        let session = Some(SessionConfig::modern());
+        // TODO: Do something with the error message?
+        Message::from_octets(octets, session).map_err(|_err| ShortBuf)
+    }
+}
+
+pub type SrvOut = Result<CallResult<BytesMut>, ServiceError<()>>;
+
+struct BgpStreamState {
+    session: Session<CombinedConfig>,
+    cmds_tx: mpsc::Sender<Command>,
+    sess_rx: mpsc::Receiver<rotonda_fsm::bgp::session::Message>,
+    live_sessions: Weak<Mutex<LiveSessions>>,
+    tick_notify: Arc<Notify>,
+}
+
+#[derive(Clone, Debug)]
+struct BgpTcpStreamServiceFactory;
+
+impl BgpTcpStreamServiceFactory {
+    fn build(
+        gate: Gate,
+        my_asn: Asn,
+        my_bgp_id: [u8; 4],
+        peer_configs: Arc<ArcSwap<PeerConfigs>>,
+        live_sessions: Weak<Mutex<LiveSessions>>,
+    ) -> impl Service<SocketAddr, BgpBytes, BgpStreamState> {
+        // The inner clones are a problem, they'll happen on EVERY message.
+        // This is due to the lack of strict ordering of processing of messages
+        // for a single TCP stream, even with the introduction of
+        // Transaction::OrderedXxx() which does guarantee ordering but the
+        // compiler can't tell that so can't let us use a single cloned gate
+        // per stream.
+        let connect_fn = move |addr| {
+            Self::connect(
+                addr,
+                gate.clone(),
+                my_asn,
+                my_bgp_id,
+                peer_configs.clone(),
+                live_sessions.clone(),
+            )
+        };
+
+        (connect_fn, Self::call, Self::disconnect)
+    }
+
+    fn connect(
+        addr: SocketAddr,
+        gate: Gate,
+        my_asn: Asn,
+        my_bgp_id: [u8; 4],
+        peer_configs: Arc<ArcSwap<PeerConfigs>>,
+        live_sessions: Weak<Mutex<LiveSessions>>) -> Result<Option<BgpStreamState>, ()>
+    {
+        if let Some((remote_net, cfg)) = peer_configs.load().get(addr.ip()) {
+            let (cmds_tx, cmds_rx) = mpsc::channel(16);
+            let (sess_tx, sess_rx) = mpsc::channel::<rotonda_fsm::bgp::session::Message>(100);
+            let candidate_config = CombinedConfig::new(my_asn, my_bgp_id, cfg.clone(), remote_net);
+
+            /*
+            //  - depending on candidate_config, with or without DelayOpen
+            //  Ugly use of temp bool here, because candidate_config is moved.
+            //  We do not want to put this logic in BgpSession itself, because this
+            //  all looks a bit to rotonda-unit specific.
+            */
+            let delay_open = !candidate_config.is_exact();
+            debug!(
+                "delay_open for {}: {}",
+                candidate_config.peer_config().name(),
+                delay_open
+            );
+
+            let mut session = Session::new(candidate_config, None, sess_tx, cmds_rx);
+
+            if delay_open {
+                session.enable_delay_open();
+            }
+
+            let tick_notify = Arc::new(Notify::new());
+            let notify_rx = tick_notify.clone();
+
+            crate::tokio::spawn("bgp-connect-fastforward", async move {
+                session.manual_start().await;
+                session.connection_established().await;
+
+                // Don't tick too fast otherwise tick() spends all its time
+                // handling the None connection that returns immediately.
+                let mut interval = time::interval(Duration::from_millis(100));
+                while session.tick().await.is_ok() {
+                    tokio::select! {
+                        _ = interval.tick() => { },
+                        _ = notify_rx.notified() => break,
+                    }
+                }
+            });
+
+            Ok(Some(BgpStreamState {
+                session,
+                cmds_tx,
+                sess_rx,
+                live_sessions,
+                tick_notify,
+            }))
+        } else {
+            debug!("No config to accept {}", addr.ip());
+            Err(())
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn call<SrvErr>(
+        addr: SocketAddr,
+        msg: Message<Bytes>,
+        custom_state: Option<BgpStreamState>,
+    ) -> Result<
+        (
+            Transaction<impl Future<Output = SrvOut>, Empty<SrvOut>>,
+            Option<BgpStreamState>,
+        ),
+        ServiceError<SrvErr>,
+    > {
+        todo!()
+    }
+
+    fn disconnect(addr: SocketAddr, custom_state: Option<BgpStreamState>) {
+        if let Some(custom_state) = custom_state {
+            custom_state.tick_notify.notify_one()
+        }
+    }
+}
 
 // XXX copied from BmpTcpIn, we probably want to separate these out
 
@@ -149,7 +360,14 @@ impl BgpTcpIn {
         // them.
         waitpoint.running().await;
 
-        BgpTcpInRunner::new(self, gate, metrics, status_reporter, roto_scripts)
+        let live_sessions = Arc::new(Mutex::new(LiveSessions::new()));
+
+        let service = BgpTcpStreamServiceFactory::build(
+            gate.clone(),
+            live_sessions.clone(),
+        );
+
+        BgpTcpInRunner::new(self, gate, metrics, status_reporter, roto_scripts, live_sessions)
             .run::<_, _, StandardTcpStream, BgpTcpInRunner>(Arc::new(StandardTcpListenerFactory))
             .await
     }
@@ -170,7 +388,7 @@ trait ConfigAcceptor {
     );
 }
 
-pub type LiveSessions = HashMap<(IpAddr, Asn), mpsc::Sender<Command>>;
+pub(super) type LiveSessions = HashMap<(IpAddr, Asn), mpsc::Sender<Command>>;
 
 struct BgpTcpInRunner {
     // The configuration from the .conf.
@@ -195,6 +413,7 @@ impl BgpTcpInRunner {
         metrics: Arc<BgpTcpInMetrics>,
         status_reporter: Arc<BgpTcpInStatusReporter>,
         roto_scripts: RotoScripts,
+        live_sessions: Arc<Mutex<LiveSessions>>,
     ) -> Self {
         BgpTcpInRunner {
             bgp,
@@ -216,7 +435,7 @@ impl BgpTcpInRunner {
             metrics: Default::default(),
             status_reporter: Default::default(),
             roto_scripts: Default::default(),
-            live_sessions: Arc::new(Mutex::new(HashMap::new())),
+            live_sessions: Default::default(),
         };
 
         (runner, gate_agent)
@@ -394,7 +613,7 @@ impl ConfigAcceptor for BgpTcpInRunner {
                 gate.clone(),
                 bgp.clone(),
                 tcp_stream,
-                CombinedConfig::new(bgp.clone(), cfg.clone(), remote_net),
+                CombinedConfig::from_config(bgp.clone(), cfg.clone(), remote_net),
                 cmds_tx.clone(),
                 cmds_rx,
                 child_status_reporter,

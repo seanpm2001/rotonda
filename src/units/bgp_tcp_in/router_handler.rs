@@ -616,7 +616,7 @@ mod tests {
         let unit_settings = BgpTcpIn::mock("dummy-listen-address", Asn::from_u32(12345));
         let peer_config = PeerConfig::mock();
         let remote_net = PrefixOrExact::Exact("10.0.0.1".parse().unwrap());
-        let config = CombinedConfig::new(unit_settings.clone(), peer_config, remote_net);
+        let config = CombinedConfig::from_config(unit_settings.clone(), peer_config, remote_net);
         let session = MockBgpSession(config);
         let (mut p, gate_agent) = Processor::mock(unit_settings);
         let (sess_tx, sess_rx) = mpsc::channel::<Message>(100);

@@ -498,10 +498,12 @@ impl RotoScripts {
                 rx,
                 tx: None,
                 output_stream_queue,
-            } => Ok(ControlFlow::Continue(FilterOutput::from((
+            } => {
+                Ok(ControlFlow::Continue(FilterOutput::from((
                 rx,
                 output_stream_queue,
-            )))),
+            ))))
+        },
 
             VmResult {
                 accept_reject: AcceptReject::Accept,
