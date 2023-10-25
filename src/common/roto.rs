@@ -477,7 +477,7 @@ impl RotoScripts {
                 stateful_vm.vm = self.build_vm(filter_name)?;
                 stateful_vm.built_when = found_filter.parent_script.loaded_when;
             } else {
-                stateful_vm.vm.reset();
+                stateful_vm.vm.reset_stack();
             }
         }
 
